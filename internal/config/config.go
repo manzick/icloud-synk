@@ -49,6 +49,10 @@ type Config struct {
 	// Conflict is one of "both" (keep both versions), "newer", "remote".
 	Conflict string `json:"conflict"`
 
+	// BackupRetention limits proven, completed replacement backups per file.
+	// -1 retains all; 0 trashes backups after verification; positive values keep N.
+	BackupRetention int `json:"backup_retention"`
+
 	// MaxFileSize skips files larger than this many bytes (0 = no limit).
 	MaxFileSize int64 `json:"max_file_size"`
 
@@ -103,6 +107,7 @@ func Defaults() *Config {
 		DeleteLocal:      true,
 		ProtectDeletions: true,
 		Conflict:         "both",
+		BackupRetention:  -1,
 		Notify:           true,
 		Exclude: []string{
 			".icloud-synk", ".DS_Store", "*.part", "*.crdownload", "*.partial",
@@ -198,6 +203,9 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("drive_subfolder contains an invalid path component %q", part)
 			}
 		}
+	}
+	if c.BackupRetention < -1 {
+		return fmt.Errorf("backup_retention must be -1, 0, or a positive integer")
 	}
 	if c.Workers < 1 {
 		c.Workers = 1

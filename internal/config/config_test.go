@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,6 +11,37 @@ func TestDefaultsProtectDeletions(t *testing.T) {
 	cfg := Defaults()
 	if !cfg.ProtectDeletions {
 		t.Fatal("ProtectDeletions must be enabled by default")
+	}
+}
+
+func TestBackupRetentionConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		raw   string
+		want  int
+		valid bool
+	}{
+		{`{}`, -1, true}, {`{"backup_retention":-1}`, -1, true},
+		{`{"backup_retention":0}`, 0, true}, {`{"backup_retention":1}`, 1, true},
+		{`{"backup_retention":3}`, 3, true}, {`{"backup_retention":-2}`, -2, false},
+	} {
+		t.Run(tc.raw, func(t *testing.T) {
+			cfg := Defaults()
+			cfg.TargetDir = t.TempDir()
+			if err := json.Unmarshal([]byte(tc.raw), cfg); err != nil {
+				t.Fatal(err)
+			}
+			if cfg.BackupRetention != tc.want {
+				t.Fatalf("retention=%d, want %d", cfg.BackupRetention, tc.want)
+			}
+			if err := cfg.Validate(); (err == nil) != tc.valid {
+				t.Fatalf("validation: %v", err)
+			}
+		})
+	}
+	for _, raw := range []string{`{"backup_retention":1.5}`, `{"backup_retention":"0"}`} {
+		if err := json.Unmarshal([]byte(raw), Defaults()); err == nil {
+			t.Fatalf("accepted unsupported value: %s", raw)
+		}
 	}
 }
 

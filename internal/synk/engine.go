@@ -67,25 +67,26 @@ func NewEngine(cfg *config.Config, cl *icloud.Client, st *State, log *slog.Logge
 
 // Stats summarises a pass.
 type Stats struct {
-	Downloaded int
-	Uploaded   int
-	Created    int
-	TrashedLoc int
-	TrashedRem int
-	Conflicts  int
-	Skipped    int
-	Errors     int
-	Bytes      int64
+	Downloaded    int
+	Uploaded      int
+	Created       int
+	TrashedLoc    int
+	TrashedRem    int
+	Conflicts     int
+	Skipped       int
+	Errors        int
+	CleanupErrors int // non-fatal retention failures; successful transfers stay successful
+	Bytes         int64
 }
 
 func (s Stats) String() string {
-	return fmt.Sprintf("↓%d ↑%d +%d 🗑%d/%d ⚡%d ⚠%d",
-		s.Downloaded, s.Uploaded, s.Created, s.TrashedLoc, s.TrashedRem, s.Conflicts, s.Errors)
+	return fmt.Sprintf("↓%d ↑%d +%d 🗑%d/%d ⚡%d ⚠%d cleanup_errors=%d",
+		s.Downloaded, s.Uploaded, s.Created, s.TrashedLoc, s.TrashedRem, s.Conflicts, s.Errors, s.CleanupErrors)
 }
 
 // Empty reports whether the pass changed nothing.
 func (s Stats) Empty() bool {
-	return s.Downloaded+s.Uploaded+s.Created+s.TrashedLoc+s.TrashedRem+s.Errors == 0
+	return s.Downloaded+s.Uploaded+s.Created+s.TrashedLoc+s.TrashedRem+s.Errors+s.CleanupErrors == 0
 }
 
 // EnsureDirs creates the local layout.
@@ -413,6 +414,9 @@ func (e *Engine) apply(ctx context.Context, ops []Op) Stats {
 	stats.TrashedRem += trashed
 	stats.Errors += trashErrs
 
+	if err := e.cleanupBackups(ctx); err != nil {
+		stats.CleanupErrors++
+	}
 	return stats
 }
 
@@ -421,6 +425,7 @@ func (s *Stats) add(o Stats) {
 	s.Uploaded += o.Uploaded
 	s.Conflicts += o.Conflicts
 	s.Errors += o.Errors
+	s.CleanupErrors += o.CleanupErrors
 	s.Bytes += o.Bytes
 	s.Skipped += o.Skipped
 }
@@ -806,6 +811,7 @@ func (e *Engine) upload(ctx context.Context, op Op, passStamp string) (int64, er
 		return 0, fmt.Errorf("upload of %q did not consume the complete snapshot; remote versions retained", op.Path)
 	}
 	var remoteAfter *icloud.Item
+	var retainedBackup *icloud.Item
 	if existing != nil {
 		// Confirm the temporary upload and its content before touching the old
 		// file. On every failure, leave all remote versions in place.
@@ -817,12 +823,28 @@ func (e *Engine) upload(ctx context.Context, op Op, passStamp string) (int64, er
 			return 0, fmt.Errorf("temporary upload for %q failed content verification; existing file retained: %w", op.Path, err)
 		}
 
+		// Persist proven temporary identity before moving the recoverable old
+		// version. Unfinished records remain protected across restarts.
+		if err := e.recordArtifact(op.Path, parent, *tempItem, "new"); err != nil {
+			return 0, err
+		}
 		backupName := replacementSiblingName(name, "backup", stamp)
+		children, err := e.remoteChildren(ctx, parent)
+		if err != nil {
+			return 0, err
+		}
+		if findRemoteItem(children, backupName) != nil {
+			return 0, fmt.Errorf("backup name already exists; refusing replacement of %q", op.Path)
+		}
 		backupItem, err := e.renameRemoteAndConfirm(ctx, parent, *existing, backupName)
 		if err != nil {
 			return 0, fmt.Errorf("could not confirm backup of %q; remote versions were retained where possible: %w", op.Path, err)
 		}
 
+		if err := e.recordArtifact(op.Path, parent, backupItem, "backup"); err != nil {
+			return 0, err
+		}
+		retainedBackup = &backupItem
 		target, err := e.renameRemoteAndConfirm(ctx, parent, *tempItem, name)
 		if err != nil {
 			// Restore the old name only if the target name is currently absent.
@@ -851,6 +873,9 @@ func (e *Engine) upload(ctx context.Context, op Op, passStamp string) (int64, er
 					op.Path, backupName, verifyErr)
 			}
 
+			if err := e.recordArtifact(op.Path, parent, failedItem, "failed"); err != nil {
+				e.log.Warn("could not persist failed replacement identity; artifact retained", "path", op.Path, "err", err)
+			}
 			items, listErr := e.remoteChildren(ctx, parent)
 			if listErr != nil {
 				e.log.Error("could not list remote folder before restoring backup",
@@ -923,6 +948,17 @@ func (e *Engine) upload(ctx context.Context, op Op, passStamp string) (int64, er
 		Zone:        remoteAfter.Zone,
 		RemoteMTime: remoteAfter.ModTime(),
 	})
+	if retainedBackup != nil {
+		a := e.st.Artifacts()[retainedBackup.DrivewsID]
+		a.Complete = true
+		e.st.putArtifact(a)
+		e.st.deleteArtifact(remoteAfter.DrivewsID)
+		if err := e.st.Save(); err != nil {
+			a.Complete = false
+			e.st.putArtifact(a)
+			return 0, fmt.Errorf("saving completed replacement; backups retained: %w", err)
+		}
+	}
 	return info.Size(), nil
 }
 

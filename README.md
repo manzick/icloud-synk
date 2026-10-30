@@ -215,6 +215,7 @@ by itself, no restart needed.
   "delete_remote": true,
   "delete_local": true,
   "conflict": "both",
+  "backup_retention": -1,
   "max_file_size": 0,
   "exclude": [".icloud-synk", ".DS_Store", "*.part", "*.crdownload", "*.partial",
               ".goutputstream-*", "~$*", ".~lock.*", "*.swp", "4913", ".Trash-*"],
@@ -229,6 +230,10 @@ by itself, no restart needed.
   side. Both apply to `Drive/` only and have no effect on `Photos/`.
 * `conflict` — `both` (keep both versions), `newer` (the newer one wins),
   `remote` (the iCloud version always wins, the local one goes to the local trash).
+* `backup_retention` — `-1` (default) keeps all replacement backups; `0` moves proven backups
+  to iCloud trash after a verified replacement; a positive integer keeps the newest N
+  proven backups per original file. Values below `-1` are invalid. Historical and
+  interrupted artifacts are preserved. See [backup retention](BACKUP_RETENTION.md).
 * `exclude` — patterns are matched against every path segment.
 * `password_command` — a command that prints the password, for logging in without a terminal
   (e.g. `secret-tool lookup service icloud`). The `ICLOUD_PASSWORD` variable works too.

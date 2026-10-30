@@ -181,6 +181,7 @@ sudo loginctl enable-linger $USER
   "delete_remote": true,
   "delete_local": true,
   "conflict": "both",
+  "backup_retention": -1,
   "max_file_size": 0,
   "exclude": [".icloud-synk", ".DS_Store", "*.part", "*.crdownload", "*.partial",
               ".goutputstream-*", "~$*", ".~lock.*", "*.swp", "4913", ".Trash-*"],
@@ -195,6 +196,11 @@ sudo loginctl enable-linger $USER
   Оба касаются только `Drive/`; на `Photos/` они не действуют.
 * `conflict` — `both` (сохранить обе версии), `newer` (побеждает более новая),
   `remote` (всегда версия из iCloud, локальная уходит в локальную корзину).
+* `backup_retention` — `-1` (по умолчанию): хранить все резервные версии;
+  `0`: перемещать подтверждённые резервные копии в корзину iCloud после проверки замены;
+  положительное число: хранить N последних подтверждённых копий каждого файла.
+  Значения меньше `-1` недопустимы. Старые копии без подтверждённого происхождения
+  и незавершённые замены сохраняются. Подробнее: [backup retention](BACKUP_RETENTION.md).
 * `exclude` — шаблоны сопоставляются с каждым сегментом пути.
 * `password_command` — команда, печатающая пароль, для входа без терминала
   (например `secret-tool lookup service icloud`). Альтернатива — переменная

@@ -55,11 +55,12 @@ type State struct {
 }
 
 type stateFile struct {
-	Version  int                    `json:"version"`
-	Updated  time.Time              `json:"updated,omitzero"`
-	Drive    map[string]*Entry      `json:"drive"`
-	Photos   map[string]*PhotoEntry `json:"photos"`
-	SyncedAt time.Time              `json:"synced_at,omitzero"`
+	Version   int                            `json:"version"`
+	Updated   time.Time                      `json:"updated,omitzero"`
+	Drive     map[string]*Entry              `json:"drive"`
+	Photos    map[string]*PhotoEntry         `json:"photos"`
+	Artifacts map[string]ReplacementArtifact `json:"replacement_artifacts,omitempty"`
+	SyncedAt  time.Time                      `json:"synced_at,omitzero"`
 }
 
 // LoadState reads the state file, tolerating a missing one.
