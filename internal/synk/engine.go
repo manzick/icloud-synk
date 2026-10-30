@@ -52,11 +52,6 @@ type Engine struct {
 	dirMu      sync.Mutex
 	remoteDirs map[string]icloud.Item
 
-	// stale holds folders that were uploaded into and whose etags must be
-	// re-read before the pass ends.
-	staleMu sync.Mutex
-	stale   map[string]struct{}
-
 	// replacementSkipLogged prevents repeated log messages for retained
 	// internal replacement files during the lifetime of this engine.
 	replacementSkipLogged sync.Map
@@ -418,9 +413,6 @@ func (e *Engine) apply(ctx context.Context, ops []Op) Stats {
 	stats.TrashedRem += trashed
 	stats.Errors += trashErrs
 
-	if err := e.refreshEtags(ctx); err != nil {
-		e.log.Debug("refreshing etags", "err", err)
-	}
 	return stats
 }
 
@@ -719,15 +711,21 @@ func (e *Engine) upload(ctx context.Context, op Op, passStamp string) (int64, er
 		return 0, err
 	}
 
-	f, err := os.Open(src)
+	// Upload an immutable snapshot, including on retries. Never associate a
+	// later local edit with the bytes sent to iCloud.
+	f, err := snapshotUpload(src, info)
 	if err != nil {
 		return 0, err
 	}
+	defer os.Remove(f.Name())
 	defer f.Close()
+	expectedHash, err := fileSHA256(f.Name())
+	if err != nil {
+		return 0, err
+	}
 
 	h := sha256.New()
 	name := path.Base(op.Path)
-	prev := e.st.Drive()[op.Path]
 
 	// Only enter replacement mode when reconciliation identified an existing
 	// remote file at this exact path. Refresh its metadata before renaming it.
@@ -738,6 +736,10 @@ func (e *Engine) upload(ctx context.Context, op Op, passStamp string) (int64, er
 			return 0, fmt.Errorf("listing remote parent before replacement: %w", listErr)
 		}
 		if item := findRemoteItem(items, name); item != nil {
+			if remoteChanged(*item, Entry{Etag: op.Remote.Etag, Size: op.Remote.Size,
+				DrivewsID: op.Remote.DrivewsID, DocwsID: op.Remote.DocwsID, Zone: op.Remote.Zone}, true) {
+				return 0, fmt.Errorf("cannot safely replace %q: remote file changed since reconciliation", op.Path)
+			}
 			copy := *item
 			existing = &copy
 		} else {
@@ -800,17 +802,18 @@ func (e *Engine) upload(ctx context.Context, op Op, passStamp string) (int64, er
 		return 0, uploadErr
 	}
 
+	if hex.EncodeToString(h.Sum(nil)) != expectedHash {
+		return 0, fmt.Errorf("upload of %q did not consume the complete snapshot; remote versions retained", op.Path)
+	}
 	var remoteAfter *icloud.Item
 	if existing != nil {
-		expectedHash := hex.EncodeToString(h.Sum(nil))
-
 		// Confirm the temporary upload and its content before touching the old
 		// file. On every failure, leave all remote versions in place.
 		tempItem, err := e.findRemoteItemRetry(ctx, parent, uploadName)
 		if err != nil {
 			return 0, fmt.Errorf("temporary upload for %q was not confirmed; existing file retained: %w", op.Path, err)
 		}
-		if err := e.verifyRemoteHash(ctx, *tempItem, expectedHash); err != nil {
+		if err := e.verifyUploadedItem(ctx, *tempItem, expectedHash, info.Size()); err != nil {
 			return 0, fmt.Errorf("temporary upload for %q failed content verification; existing file retained: %w", op.Path, err)
 		}
 
@@ -836,7 +839,7 @@ func (e *Engine) upload(ctx context.Context, op Op, passStamp string) (int64, er
 			return 0, fmt.Errorf("new version could not be confirmed at original name %q; backup %q retained: %w", op.Path, backupName, err)
 		}
 
-		if verifyErr := e.verifyRemoteHash(ctx, target, expectedHash); verifyErr != nil {
+		if verifyErr := e.verifyUploadedItem(ctx, target, expectedHash, info.Size()); verifyErr != nil {
 			// Preserve the unverified new version under a separate name before
 			// restoring the old version to the original path.
 			failedName := replacementSiblingName(name, "failed", stamp)
@@ -883,25 +886,85 @@ func (e *Engine) upload(ctx context.Context, op Op, passStamp string) (int64, er
 			"path", op.Path, "backup", backupItem.FullName())
 	}
 
-	// The new etag is unknown until the folder is re-listed; refreshEtags does
-	// that once per pass. Keep the previous ids so the entry stays usable.
-	drivewsID, docwsID := prev.DrivewsID, prev.DocwsID
-	if remoteAfter != nil {
-		drivewsID = remoteAfter.DrivewsID
-		docwsID = remoteAfter.DocwsID
+	if remoteAfter == nil {
+		// Creation has no verified target yet. Complete only this file's
+		// metadata, and verify its content before advancing the baseline.
+		target, err := e.findRemoteItemRetry(ctx, parent, name)
+		if err != nil {
+			return 0, fmt.Errorf("upload of %q succeeded but metadata confirmation is incomplete; remote file retained: %w", op.Path, err)
+		}
+		if err := e.verifyUploadedItem(ctx, *target, expectedHash, info.Size()); err != nil {
+			return 0, fmt.Errorf("upload of %q could not be verified; remote file retained: %w", op.Path, err)
+		}
+		remoteAfter = target
+	}
+
+	// Preserve the previous baseline if the source changed while uploading.
+	// The remote versions remain intact; the next pass can reconcile safely.
+	current, err := os.Stat(src)
+	if err != nil {
+		return 0, fmt.Errorf("checking local source after upload: %w", err)
+	}
+	localHash, err := fileSHA256(src)
+	if err != nil {
+		return 0, err
+	}
+	if !os.SameFile(info, current) || current.Size() != info.Size() ||
+		!current.ModTime().Equal(info.ModTime()) || localHash != expectedHash {
+		return 0, fmt.Errorf("local file %q changed during upload; previous sync state and remote versions retained", op.Path)
 	}
 	e.st.PutDrive(op.Path, Entry{
-		Size:        info.Size(),
+		Size:        remoteAfter.Size,
 		LocalMTime:  info.ModTime(),
-		SHA256:      hex.EncodeToString(h.Sum(nil)),
-		Etag:        "", // refreshed below
-		DrivewsID:   drivewsID,
-		DocwsID:     docwsID,
-		Zone:        parent.Zone,
-		RemoteMTime: info.ModTime(),
+		SHA256:      expectedHash,
+		Etag:        remoteAfter.Etag,
+		DrivewsID:   remoteAfter.DrivewsID,
+		DocwsID:     remoteAfter.DocwsID,
+		Zone:        remoteAfter.Zone,
+		RemoteMTime: remoteAfter.ModTime(),
 	})
-	e.markStale(parentRel)
 	return info.Size(), nil
+}
+
+// snapshotUpload captures the bytes and rejects observable source changes during
+// the copy. The caller owns closing and removing the private temporary file.
+func snapshotUpload(src string, info os.FileInfo) (*os.File, error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return nil, err
+	}
+	defer in.Close()
+	opened, err := in.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) ||
+		opened.Size() != info.Size() || !opened.ModTime().Equal(info.ModTime()) {
+		return nil, fmt.Errorf("local source %q changed before upload", src)
+	}
+	out, err := os.CreateTemp("", "icloud-synk-upload-*")
+	if err != nil {
+		return nil, err
+	}
+	n, copyErr := io.Copy(out, in)
+	after, statErr := in.Stat()
+	if copyErr != nil || statErr != nil || n != info.Size() ||
+		!after.ModTime().Equal(info.ModTime()) || after.Size() != info.Size() {
+		out.Close()
+		os.Remove(out.Name())
+		return nil, fmt.Errorf("snapshotting local source %q failed or source changed: %w", src,
+			errors.Join(copyErr, statErr, errors.New("snapshot incomplete or unstable")))
+	}
+	return out, nil
+}
+
+// verifyUploadedItem never treats a name match alone as upload confirmation.
+func (e *Engine) verifyUploadedItem(ctx context.Context, item icloud.Item, expectedHash string, size int64) error {
+	if item.Type != icloud.TypeFile || item.ItemCount != 0 || item.DrivewsID == "" ||
+		item.DocwsID == "" || item.Etag == "" || item.Zone == "" || item.Size != size {
+		return fmt.Errorf("incomplete or inconsistent uploaded file metadata for %q", item.FullName())
+	}
+	return e.verifyRemoteHash(ctx, item, expectedHash)
 }
 
 // remoteChildren returns the direct children of a remote folder.
@@ -1233,71 +1296,6 @@ func (e *Engine) moveToLocalTrash(rel, stamp string) error {
 		return os.RemoveAll(src)
 	}
 	return nil
-}
-
-// markStale notes a folder whose etags must be re-read after uploads.
-func (e *Engine) markStale(rel string) {
-	e.staleMu.Lock()
-	if e.stale == nil {
-		e.stale = map[string]struct{}{}
-	}
-	e.stale[rel] = struct{}{}
-	e.staleMu.Unlock()
-}
-
-// refreshEtags re-lists the folders we uploaded into, so the state holds the
-// etag iCloud assigned. Without it, the next pass would see a phantom change.
-func (e *Engine) refreshEtags(ctx context.Context) error {
-	e.staleMu.Lock()
-	stale := e.stale
-	e.stale = nil
-	e.staleMu.Unlock()
-
-	if len(stale) == 0 || e.dryRun {
-		return nil
-	}
-	byID := make(map[string]string, len(stale))
-	for rel := range stale {
-		if it, ok := e.lookupDir(rel); ok {
-			byID[it.DrivewsID] = rel
-		}
-	}
-	ids := make([]string, 0, len(byID))
-	for id := range byID {
-		ids = append(ids, id)
-	}
-	for len(ids) > 0 {
-		n := min(len(ids), folderBatch)
-		folders, err := e.cl.ListFolders(ctx, ids[:n])
-		if err != nil {
-			return err
-		}
-		ids = ids[n:]
-		for _, f := range folders {
-			rel := byID[f.DrivewsID]
-			for _, it := range f.Items {
-				if it.IsDir() {
-					continue
-				}
-				name := sanitizeName(it.FullName())
-				childRel := name
-				if rel != "" {
-					childRel = rel + "/" + name
-				}
-				prev, ok := e.st.Drive()[childRel]
-				if !ok {
-					continue
-				}
-				prev.Etag = it.Etag
-				prev.DrivewsID = it.DrivewsID
-				prev.DocwsID = it.DocwsID
-				prev.Zone = it.Zone
-				prev.RemoteMTime = it.ModTime()
-				e.st.PutDrive(childRel, prev)
-			}
-		}
-	}
-	return e.st.Save()
 }
 
 // createConflictCopy creates a hard link to src at a unique conflict filename.

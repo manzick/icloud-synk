@@ -150,3 +150,28 @@ creation recovery, and replacement/verification failure retention. A later
 genuine content change must still download or conflict as appropriate. An ETag
 change alone cannot universally guarantee zero network reads without stronger
 server evidence.
+
+## Implementation follow-up
+
+The approved fix retains verified replacement metadata directly and removes
+the folder-wide `refreshEtags` mechanism. Initial creations now confirm their
+exact name, complete file metadata, size and SHA-256 before advancing only that
+file's state. Missing/inconsistent metadata and verification failures are
+reported as transfer errors and leave the prior state intact. No pending-upload
+schema or state migration was introduced. After an interrupted or unconfirmed
+creation, recovery deliberately uses normal conservative reconciliation, which
+may download or preserve a conflict rather than infer upload ownership.
+
+Uploads use a private temporary snapshot, including retries, and recheck local
+identity, size, mtime and content before committing the baseline. This adds
+temporary disk use proportional to the file size; initial uploads additionally
+require a verification download. Known remote identity changes now trigger
+reconciliation even when ETag and size match. A replacement whose remote
+metadata changed since planning aborts before upload/rename. Existing backup,
+conflict and guarded rollback behavior remains in place.
+
+The characterization tests now assert convergence after confirmed replacement,
+conservative failure for incomplete creations, persistence across reload,
+genuine remote edits and identity changes, sibling isolation, source mutation,
+and retention/restoration on failed verification. The investigation above is
+retained as the historical description of the pre-fix implementation.
