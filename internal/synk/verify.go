@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -23,12 +24,13 @@ type driveVerifyClient interface {
 
 // VerifyReport contains the outcome of a read-only local/remote comparison.
 type VerifyReport struct {
-	LocalFiles   int
-	RemoteFiles  int
-	Identical    int
-	Differences  []string
-	Unverifiable []string
-	SkippedLocal []string
+	LocalFiles      int
+	RemoteFiles     int
+	Identical       int
+	Differences     []string
+	Unverifiable    []string
+	SkippedInternal []string // proven remote-only replacement artifacts
+	SkippedLocal    []string
 }
 
 // Complete reports whether every relevant file could be compared and matched.
@@ -39,12 +41,18 @@ func (r VerifyReport) Complete() bool {
 }
 
 // VerifyDrive inventories the configured iCloud folder and compares file hashes.
-// It does not create directories, invoke reconciliation, or read/write sync state.
+// It reads artifact provenance from state, but never writes state, creates
+// directories, or invokes reconciliation. Missing state proves no ownership.
 func VerifyDrive(ctx context.Context, cfg *config.Config, cl driveVerifyClient) (VerifyReport, error) {
 	var report VerifyReport
 	if err := ctx.Err(); err != nil {
 		return report, err
 	}
+	st, err := LoadState(cfg.StatePath())
+	if err != nil {
+		return report, fmt.Errorf("loading artifact provenance: %w", err)
+	}
+	artifacts := st.Artifacts()
 	scanner := &Scanner{Root: cfg.DriveDir(), Exclude: cfg.Exclude}
 	local, skipped, _, err := scanner.Scan()
 	if err != nil {
@@ -154,6 +162,18 @@ func VerifyDrive(ctx context.Context, cfg *config.Config, cl driveVerifyClient) 
 					)
 				}
 				remotePaths[rel] = item.DrivewsID
+				if a, owned := artifacts[item.DrivewsID]; owned {
+					_, localFile := localFiles[rel]
+					if artifactMatches(a, path.Dir(rel), folder.DrivewsID, item) {
+						if a.Kind != "backup" || !a.Complete {
+							report.Unverifiable = append(report.Unverifiable, "Unfinished replacement artifact retained: "+rel)
+						}
+						if !localFile && !localDirs[rel] {
+							report.SkippedInternal = append(report.SkippedInternal, rel)
+							continue
+						}
+					}
+				}
 				if item.IsDir() {
 					remoteDirs[rel] = true
 					if previousPath, exists := visited[item.DrivewsID]; exists {
@@ -186,22 +206,22 @@ func VerifyDrive(ctx context.Context, cfg *config.Config, cl driveVerifyClient) 
 
 	for p := range localDirs {
 		if !remoteDirs[p] {
-			report.Differences = append(report.Differences, "Ordner fehlt in iCloud: "+p)
+			report.Differences = append(report.Differences, "Directory missing in iCloud: "+p)
 		}
 	}
 	for p := range remoteDirs {
 		if !localDirs[p] {
-			report.Differences = append(report.Differences, "Ordner fehlt lokal: "+p)
+			report.Differences = append(report.Differences, "Directory missing locally: "+p)
 		}
 	}
 	for p := range localFiles {
 		if _, ok := remoteFiles[p]; !ok {
-			report.Differences = append(report.Differences, "Datei fehlt in iCloud: "+p)
+			report.Differences = append(report.Differences, "File missing in iCloud: "+p)
 		}
 	}
 	for p := range remoteFiles {
 		if _, ok := localFiles[p]; !ok {
-			report.Differences = append(report.Differences, "Datei fehlt lokal: "+p)
+			report.Differences = append(report.Differences, "File missing locally: "+p)
 		}
 	}
 
@@ -218,13 +238,13 @@ func VerifyDrive(ctx context.Context, cfg *config.Config, cl driveVerifyClient) 
 		}
 		item := remoteFiles[p]
 		if item.Type == icloud.TypePackage || item.ItemCount > 0 {
-			report.Unverifiable = append(report.Unverifiable, "Paketinhalt nicht direkt vergleichbar: "+p)
+			report.Unverifiable = append(report.Unverifiable, "Package contents cannot be compared directly: "+p)
 			continue
 		}
 		localPath := filepath.Join(cfg.DriveDir(), filepath.FromSlash(p))
 		before, err := os.Stat(localPath)
 		if err != nil {
-			report.Unverifiable = append(report.Unverifiable, fmt.Sprintf("Lokal nicht statbar (%s): %v", p, err))
+			report.Unverifiable = append(report.Unverifiable, fmt.Sprintf("Cannot stat local file (%s): %v", p, err))
 			continue
 		}
 		localHash, err := hashLocalFile(ctx, localPath)
@@ -232,7 +252,7 @@ func VerifyDrive(ctx context.Context, cfg *config.Config, cl driveVerifyClient) 
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return report, ctxErr
 			}
-			report.Unverifiable = append(report.Unverifiable, fmt.Sprintf("Lokal nicht lesbar (%s): %v", p, err))
+			report.Unverifiable = append(report.Unverifiable, fmt.Sprintf("Cannot read local file (%s): %v", p, err))
 			continue
 		}
 		remoteHash := sha256.New()
@@ -241,31 +261,32 @@ func VerifyDrive(ctx context.Context, cfg *config.Config, cl driveVerifyClient) 
 			return report, ctxErr
 		}
 		if err != nil {
-			report.Unverifiable = append(report.Unverifiable, fmt.Sprintf("iCloud-Abruf fehlgeschlagen (%s): %v", p, err))
+			report.Unverifiable = append(report.Unverifiable, fmt.Sprintf("iCloud download failed (%s): %v", p, err))
 			continue
 		}
 		if item.Size > 0 && n != item.Size {
-			report.Unverifiable = append(report.Unverifiable, fmt.Sprintf("iCloud-Größe unerwartet (%s): %d statt %d Bytes", p, n, item.Size))
+			report.Unverifiable = append(report.Unverifiable, fmt.Sprintf("Unexpected iCloud size (%s): received %d, expected %d bytes", p, n, item.Size))
 			continue
 		}
 		after, err := os.Stat(localPath)
 		if err != nil {
-			report.Unverifiable = append(report.Unverifiable, fmt.Sprintf("Lokale Datei nach dem Lesen nicht statbar (%s): %v", p, err))
+			report.Unverifiable = append(report.Unverifiable, fmt.Sprintf("Cannot stat local file after reading (%s): %v", p, err))
 			continue
 		}
 		if !os.SameFile(before, after) || before.Size() != after.Size() ||
 			!before.ModTime().Equal(after.ModTime()) {
-			report.Unverifiable = append(report.Unverifiable, "Lokale Datei änderte sich während der Prüfung: "+p)
+			report.Unverifiable = append(report.Unverifiable, "Local file changed during verification: "+p)
 			continue
 		}
 		if after.Size() != n || localHash != hex.EncodeToString(remoteHash.Sum(nil)) {
-			report.Differences = append(report.Differences, "Inhalt oder Größe weicht ab: "+p)
+			report.Differences = append(report.Differences, "Content or size differs: "+p)
 			continue
 		}
 		report.Identical++
 	}
 	sort.Strings(report.Differences)
 	sort.Strings(report.Unverifiable)
+	sort.Strings(report.SkippedInternal)
 	sort.Strings(report.SkippedLocal)
 	return report, nil
 }

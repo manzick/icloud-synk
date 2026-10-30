@@ -190,6 +190,7 @@ by itself, no restart needed.
 |---|---|
 | `icloud-synk login [--dir PATH] [--apple-id ID]` | log in, write config and session |
 | `icloud-synk sync [--dry-run] [--drive\|--photos]` | one pass, then exit |
+| `icloud-synk verify-drive [--dir PATH]` | read-only content verification with artifact reporting |
 | `icloud-synk daemon [--poll 30s]` | continuous sync |
 | `icloud-synk status` | Apple ID, session expiry, counters, connectivity check |
 | `icloud-synk config` | effective configuration |
@@ -197,6 +198,13 @@ by itself, no restart needed.
 | `icloud-synk version` | build version, platform and Go version |
 
 `--verbose` turns on debug logging for any command.
+
+`verify-drive` compares normal file contents and reports proven internal artifacts separately
+in English. It exits 0 when normal files match and only proven completed backups are
+skipped; differences, unfinished artifacts, or incomplete verification return exit 1.
+Historical and unrecognized backup-like files remain ordinary comparisons. Verification
+reads artifact provenance from the same target directory’s state without modifying it.
+See [verification details](BACKUP_RETENTION.md#drive-verification).
 
 ## Configuration
 

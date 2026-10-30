@@ -80,3 +80,28 @@ between requests. ETag checks protect the trash candidate against concurrent
 changes; do not treat retention as a substitute for independent backups. Finite
 retention adds verification downloads and metadata requests, favoring data safety
 over throughput.
+
+## Drive verification
+
+`icloud-synk verify-drive` still inventories the selected Drive folder and hashes
+normal local/remote file contents. It reads the artifact journal from the same
+target directory but never modifies Drive files or synchronization state. Missing
+state grants no ownership; corrupt or incompatible state produces an error.
+
+Only remote-only artifacts whose exact live identities and metadata match the
+journal are excluded from normal file counts. They appear under `Skipped internal
+artifacts` and `INTERNAL ARTIFACT SKIPPED` in the English report. Completed backup
+artifacts do not prevent success. Known unfinished temporary, recovery, or failed
+artifacts are reported separately and also marked `UNVERIFIABLE`, so an interrupted
+replacement cannot quietly make the report successful. A local counterpart is
+still compared as a normal file; a pending artifact also keeps verification
+incomplete in that case.
+
+Exit status is 0 when all normal files match, including when only proven completed
+backups differ. It is 1 for differences, unverifiable files, unfinished artifacts,
+or operational errors. Historical artifacts with no provenance, changed artifacts,
+and user files with backup-like names are not silently ignored: they undergo
+normal comparison and can cause a difference. Unknown temporary artifacts are
+likewise ordinary comparisons. There is no automatic historical-backup import or
+name-based exclusion switch; review historical files manually if they need to be
+retained elsewhere or removed.

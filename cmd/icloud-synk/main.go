@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -504,23 +505,32 @@ func cmdVerifyDrive(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Lokale Dateien: %d\nDateien in iCloud: %d\nIdentische Dateien: %d\n",
-		report.LocalFiles, report.RemoteFiles, report.Identical)
+	return writeVerifyReport(os.Stdout, report)
+}
+
+// writeVerifyReport returns the error mapped by main to exit status 1.
+// Skipped completed backups do not affect success; unfinished artifacts do.
+func writeVerifyReport(w io.Writer, report synk.VerifyReport) error {
+	fmt.Fprintf(w, "Local files: %d\nFiles in iCloud: %d\nIdentical files: %d\nSkipped internal artifacts: %d\n",
+		report.LocalFiles, report.RemoteFiles, report.Identical, len(report.SkippedInternal))
+	for _, item := range report.SkippedInternal {
+		fmt.Fprintf(w, "INTERNAL ARTIFACT SKIPPED: %s\n", item)
+	}
 	for _, item := range report.Differences {
-		fmt.Printf("ABWEICHUNG: %s\n", item)
+		fmt.Fprintf(w, "DIFFERENCE: %s\n", item)
 	}
 	for _, item := range report.Unverifiable {
-		fmt.Printf("NICHT PRÜFBAR: %s\n", item)
+		fmt.Fprintf(w, "UNVERIFIABLE: %s\n", item)
 	}
 	for _, item := range report.SkippedLocal {
-		fmt.Printf("LOKAL ÜBERSPRUNGEN: %s\n", item)
+		fmt.Fprintf(w, "LOCAL ENTRY SKIPPED: %s\n", item)
 	}
 	if report.Complete() {
-		fmt.Println("ERGEBNIS: Alle erfassten Dateien sind identisch.")
+		fmt.Fprintln(w, "RESULT: All normal files are identical.")
 		return nil
 	}
-	fmt.Println("ERGEBNIS: Prüfung unvollständig oder Abweichungen gefunden.")
-	return fmt.Errorf("verify-drive konnte keine vollständige Übereinstimmung bestätigen")
+	fmt.Fprintln(w, "RESULT: Verification incomplete or differences found.")
+	return fmt.Errorf("verify-drive could not confirm a complete match")
 }
 
 // finishSync leaves the state untouched during a dry run.

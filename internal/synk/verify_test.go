@@ -168,7 +168,7 @@ func TestVerifyDriveReportsLocalFileChangedDuringVerification(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(report.Unverifiable) != 1 ||
-		!strings.Contains(report.Unverifiable[0], "änderte sich während der Prüfung") {
+		!strings.Contains(report.Unverifiable[0], "changed during verification") {
 		t.Fatalf("expected changed local file to be unverifiable, got %+v", report)
 	}
 	if report.Complete() {
