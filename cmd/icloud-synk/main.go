@@ -511,7 +511,7 @@ func cmdVerifyDrive(args []string) error {
 // writeVerifyReport returns the error mapped by main to exit status 1.
 // Skipped completed backups do not affect success; unfinished artifacts do.
 func writeVerifyReport(w io.Writer, report synk.VerifyReport) error {
-	fmt.Fprintf(w, "Local files: %d\nFiles in iCloud: %d\nIdentical files: %d\nSkipped internal artifacts: %d\n",
+	fmt.Fprintf(w, "Local files: %d\nFiles in iCloud: %d (excluding skipped internal artifacts)\nIdentical files: %d\nSkipped internal artifacts: %d\n",
 		report.LocalFiles, report.RemoteFiles, report.Identical, len(report.SkippedInternal))
 	for _, item := range report.SkippedInternal {
 		fmt.Fprintf(w, "INTERNAL ARTIFACT SKIPPED: %s\n", item)

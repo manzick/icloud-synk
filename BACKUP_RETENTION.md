@@ -88,20 +88,39 @@ normal local/remote file contents. It reads the artifact journal from the same
 target directory but never modifies Drive files or synchronization state. Missing
 state grants no ownership; corrupt or incompatible state produces an error.
 
-Only remote-only artifacts whose exact live identities and metadata match the
-journal are excluded from normal file counts. They appear under `Skipped internal
-artifacts` and `INTERNAL ARTIFACT SKIPPED` in the English report. Completed backup
-artifacts do not prevent success. Known unfinished temporary, recovery, or failed
-artifacts are reported separately and also marked `UNVERIFIABLE`, so an interrupted
-replacement cannot quietly make the report successful. A local counterpart is
-still compared as a normal file; a pending artifact also keeps verification
-incomplete in that case.
+Remote-only artifacts whose exact live identities and metadata match the journal
+are excluded from comparison counts. In addition, remote-only regular files with
+the generated `backup` filename format are excluded when provenance is absent,
+using the same replacement-name classifier as synchronization. Each is explicitly
+listed under `Skipped internal artifacts` and `INTERNAL ARTIFACT SKIPPED`; filename-only
+classifications say `provenance unavailable, ownership not established`. This
+covers retained backups created before the current journal existed. It does not
+import provenance, prove ownership, or authorize retention cleanup.
 
-Exit status is 0 when all normal files match, including when only proven completed
-backups differ. It is 1 for differences, unverifiable files, unfinished artifacts,
-or operational errors. Historical artifacts with no provenance, changed artifacts,
-and user files with backup-like names are not silently ignored: they undergo
-normal comparison and can cause a difference. Unknown temporary artifacts are
-likewise ordinary comparisons. There is no automatic historical-backup import or
-name-based exclusion switch; review historical files manually if they need to be
-retained elsewhere or removed.
+Known unfinished temporary, recovery, or failed artifacts remain `UNVERIFIABLE`.
+Changed or inconsistent journal records cannot be bypassed by filename recognition,
+including an identity change at a recorded artifact path. Unknown `new`/`failed`
+artifacts and malformed backup-like names undergo normal comparison. Directories
+and packages are never excluded by filename alone. A local counterpart is always
+compared as a normal file; a pending artifact also keeps verification incomplete.
+
+The generated backup namespace is reserved by synchronization. A user-created
+remote-only file with exactly that naming format cannot be distinguished from a
+historical backup without provenance. Verification explicitly reports this
+classification instead of silently omitting it. Rename such user files outside
+that namespace if they should participate in normal verification.
+
+Counter semantics (after configured exclusions):
+
+* `Local files`: files in the local comparison inventory, including local artifact counterparts.
+* `Files in iCloud`: files in the remote comparison inventory **after** internal-artifact
+  filtering, not the raw inventory total.
+* `Identical files`: files whose actual local and downloaded remote contents matched.
+* `Skipped internal artifacts`: remote-only artifacts excluded from comparison,
+  including explicitly labeled filename-only backups. Unfinished proven artifacts
+  may appear here but still prevent success through `UNVERIFIABLE`.
+
+Exit status is 0 only when all comparison files match and there are no differences,
+unverifiable entries, or skipped local entries. Skipped completed or historical
+backups alone do not prevent success. Verification never downloads excluded
+backups, changes remote data, or writes synchronization state.

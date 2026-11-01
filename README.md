@@ -30,9 +30,9 @@ tested on Ubuntu Linux.
 
   ```json
   {
-    "drive_subfolder": "Tappe/Dokumente sync NAS"
+    "drive_subfolder": "ExampleBackups"
   }
-
+  ```
 
 A daemon for Ubuntu (Go, no CGO) that keeps a local folder in sync with iCloud:
 
@@ -125,7 +125,7 @@ Or straight through Go:
 go install github.com/kolesnikav/icloud-synk/cmd/icloud-synk@latest
 ```
 
-Requires Go 1.24+ (built and tested on 1.26). One external dependency: `fsnotify`.
+Requires Go 1.25+ for confined filesystem operations. Dependencies: `fsnotify` and `x/sys`.
 
 ## First run
 
@@ -199,12 +199,14 @@ by itself, no restart needed.
 
 `--verbose` turns on debug logging for any command.
 
-`verify-drive` compares normal file contents and reports proven internal artifacts separately
-in English. It exits 0 when normal files match and only proven completed backups are
-skipped; differences, unfinished artifacts, or incomplete verification return exit 1.
-Historical and unrecognized backup-like files remain ordinary comparisons. Verification
-reads artifact provenance from the same target directory’s state without modifying it.
-See [verification details](BACKUP_RETENTION.md#drive-verification).
+`verify-drive` compares normal file contents and lists skipped internal artifacts
+separately in English. Remote-only backups with generated replacement filenames
+can be skipped even without provenance, as during synchronization; those entries
+explicitly state that ownership is not established. Local counterparts are still
+compared, and unfinished artifacts or conflicting provenance cannot silently pass.
+`Files in iCloud` counts comparison files after internal-artifact filtering.
+Filename recognition never authorizes backup cleanup. Verification is read-only;
+see [verification details and reserved-name ambiguity](BACKUP_RETENTION.md#drive-verification).
 
 ## Configuration
 
@@ -245,6 +247,80 @@ See [verification details](BACKUP_RETENTION.md#drive-verification).
 * `exclude` — patterns are matched against every path segment.
 * `password_command` — a command that prints the password, for logging in without a terminal
   (e.g. `secret-tool lookup service icloud`). The `ICLOUD_PASSWORD` variable works too.
+
+### Multiple independent Drive folders
+
+Use `drive_subfolders` to synchronize several existing remote folders with one
+client, authentication session, process, and coordinated Drive pass:
+
+```json
+{
+  "target_dir": "/data",
+  "sync_drive": true,
+  "sync_photos": false,
+  "protect_deletions": true,
+  "drive_subfolders": [
+    {"remote": "ExampleBackups", "local": "backups"},
+    {"remote": "ExampleApp/widgets-data", "local": "widgets"}
+  ]
+}
+```
+
+`remote` is relative to the iCloud Drive root. `local` is relative to
+`target_dir/Drive/`: the example produces `/data/Drive/backups/` and
+`/data/Drive/widgets/`, sharing `/data/.icloud-synk/state.json`. Ordinary files
+inside accessible application containers are supported; iWork bundles remain
+unsupported.
+
+* Omitting `drive_subfolders` preserves full-Drive or legacy `drive_subfolder`
+  behavior and existing state keys. A nonempty `drive_subfolder` cannot be used
+  together with `drive_subfolders`; an empty mapping list is rejected.
+* Paths must be nonempty relative paths separated by `/`. Absolute paths,
+  backslashes, colons, NUL, empty components, `.`, `..`, and leading/trailing
+  component whitespace are rejected. Local destinations and remote roots must
+  be distinct and non-overlapping, including case-insensitive comparisons.
+* Mapped synchronization rejects symlinks in the Drive and metadata trees and
+  their ancestors. Drive writes and mapped state saves are confined to
+  `target_dir`, including when paths change during a transfer. Use ordinary
+  directories on Linux, including in Docker; filesystem mounts must be trusted.
+* Every mapping must finish discovery before reconciliation is applied. Missing,
+  inaccessible, ambiguous, or incomplete remote inventories abort the whole
+  Drive pass. Configured remote roots are never created automatically.
+* Existing conflict, deletion protection, deletion flags, and backup retention
+  policies apply independently to every mapped path. Only configured local
+  subtrees participate. Dry-run paths include the local mapping prefix;
+  verification messages identify both the remote and local mapping.
+* Legacy state stays version 1 with the same file keys. Mapped state adds an
+  optional `drive_mappings` binding and uses keys such as `backups/file.txt`.
+  Mapping order can change, but changing, adding, removing, or renaming a
+  binding is rejected once saved. Populated legacy Drive state is never
+  automatically reinterpreted: use a **fresh target directory** to switch to
+  mappings and retain the old mirror/state. No existing state is discarded.
+  Do not open mapped state with older versions that lack this feature.
+
+For Docker on a Raspberry Pi 5, build the image on the Pi and keep the
+configuration/session volume separate from the data volume:
+
+```bash
+docker build -t icloud-synk:local .
+mkdir -p ./synk-config ./synk-data
+# Put the configuration above in ./synk-config/config.json (target_dir: /data).
+# Before login, create the example remote folders using iCloud's own UI.
+# Use a spare Apple ID for initial testing.
+docker run --rm -it \
+  -v "$PWD/synk-config:/root/.config/icloud-synk" \
+  -v "$PWD/synk-data:/data" icloud-synk:local login --dir /data
+docker run --rm \
+  -v "$PWD/synk-config:/root/.config/icloud-synk" \
+  -v "$PWD/synk-data:/data" icloud-synk:local sync --drive --dry-run
+docker run -d --name icloud-synk --restart unless-stopped \
+  -v "$PWD/synk-config:/root/.config/icloud-synk" \
+  -v "$PWD/synk-data:/data" icloud-synk:local daemon
+```
+
+The same configuration works with `sync`, `sync --dry-run`, `daemon`, and
+`verify-drive`. Stop the daemon before running manual synchronization commands
+against the same target directory. The Docker architecture is unchanged.
 
 ## How it decides what to copy (Drive)
 

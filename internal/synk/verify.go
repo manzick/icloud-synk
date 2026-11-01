@@ -24,12 +24,12 @@ type driveVerifyClient interface {
 
 // VerifyReport contains the outcome of a read-only local/remote comparison.
 type VerifyReport struct {
-	LocalFiles      int
-	RemoteFiles     int
-	Identical       int
+	LocalFiles      int // local files selected for comparison, including local artifact counterparts
+	RemoteFiles     int // remote comparison inventory AFTER skipping remote-only internal artifacts
+	Identical       int // files whose local and remote contents were compared and matched
 	Differences     []string
 	Unverifiable    []string
-	SkippedInternal []string // proven remote-only replacement artifacts
+	SkippedInternal []string // remote-only artifacts; filename-only classifications are explicitly labeled
 	SkippedLocal    []string
 }
 
@@ -44,6 +44,20 @@ func (r VerifyReport) Complete() bool {
 // It reads artifact provenance from state, but never writes state, creates
 // directories, or invokes reconciliation. Missing state proves no ownership.
 func VerifyDrive(ctx context.Context, cfg *config.Config, cl driveVerifyClient) (VerifyReport, error) {
+	if cfg.DriveSubfolders != nil {
+		return verifyMappings(ctx, cfg, cl)
+	}
+	st, err := LoadState(cfg.StatePath())
+	if err != nil {
+		return VerifyReport{}, err
+	}
+	if err := st.checkMappings(cfg, false); err != nil {
+		return VerifyReport{}, err
+	}
+	return verifyDriveSingle(ctx, cfg, cl, "")
+}
+
+func verifyDriveSingle(ctx context.Context, cfg *config.Config, cl driveVerifyClient, localPrefix string) (VerifyReport, error) {
 	var report VerifyReport
 	if err := ctx.Err(); err != nil {
 		return report, err
@@ -53,7 +67,28 @@ func VerifyDrive(ctx context.Context, cfg *config.Config, cl driveVerifyClient) 
 		return report, fmt.Errorf("loading artifact provenance: %w", err)
 	}
 	artifacts := st.Artifacts()
-	scanner := &Scanner{Root: cfg.DriveDir(), Exclude: cfg.Exclude}
+	// Remember identities even outside this mapping. Conflicting provenance must
+	// never be bypassed by the filename-only historical-backup fallback.
+	knownIDs := make(map[string]bool, len(artifacts))
+	for id := range artifacts {
+		knownIDs[id] = true
+	}
+
+	if localPrefix != "" {
+		for id, a := range artifacts {
+			if strings.HasPrefix(a.Original, localPrefix+"/") {
+				a.Original = strings.TrimPrefix(a.Original, localPrefix+"/")
+				artifacts[id] = a
+			} else {
+				delete(artifacts, id)
+			}
+		}
+	}
+	recordedPaths := make(map[string]bool, len(artifacts))
+	for _, a := range artifacts {
+		recordedPaths[path.Join(path.Dir(a.Original), sanitizeName(a.Item.FullName()))] = true
+	}
+	scanner := &Scanner{Root: filepath.Join(cfg.DriveDir(), filepath.FromSlash(localPrefix)), Exclude: cfg.Exclude}
 	local, skipped, _, err := scanner.Scan()
 	if err != nil {
 		return report, fmt.Errorf("local inventory incomplete: %w", err)
@@ -174,6 +209,18 @@ func VerifyDrive(ctx context.Context, cfg *config.Config, cl driveVerifyClient) 
 						}
 					}
 				}
+				// Sync reserves generated replacement names even without a journal (for
+				// example, historical backups). Verification may exclude remote-only
+				// ordinary backup files by that same classifier, but never infer ownership
+				// or completion for retention, bypass conflicting records, or hide a local
+				// counterpart. Unknown new/failed artifacts remain normal comparisons.
+				_, hasLocalFile := localFiles[rel]
+				if !hasLocalFile && !localDirs[rel] && !knownIDs[item.DrivewsID] && !recordedPaths[rel] &&
+					item.Type == icloud.TypeFile && item.ItemCount == 0 && replacementSiblingKind(name) == "backup" {
+					report.SkippedInternal = append(report.SkippedInternal, rel+" (backup filename; provenance unavailable, ownership not established)")
+					continue
+				}
+
 				if item.IsDir() {
 					remoteDirs[rel] = true
 					if previousPath, exists := visited[item.DrivewsID]; exists {
@@ -241,7 +288,7 @@ func VerifyDrive(ctx context.Context, cfg *config.Config, cl driveVerifyClient) 
 			report.Unverifiable = append(report.Unverifiable, "Package contents cannot be compared directly: "+p)
 			continue
 		}
-		localPath := filepath.Join(cfg.DriveDir(), filepath.FromSlash(p))
+		localPath := filepath.Join(cfg.DriveDir(), filepath.FromSlash(localPrefix), filepath.FromSlash(p))
 		before, err := os.Stat(localPath)
 		if err != nil {
 			report.Unverifiable = append(report.Unverifiable, fmt.Sprintf("Cannot stat local file (%s): %v", p, err))

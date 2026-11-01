@@ -30,7 +30,7 @@ func TestVerifyDriveArtifactOwnershipAndNormalDifferences(t *testing.T) {
 			normal := remoteFile("hello.txt", "normal", 5, time.Time{})
 			items := []icloud.Item{normal}
 			data := map[string][]byte{normal.DocwsID: []byte("hello")}
-			wantSkipped, wantComplete := 0, mode == "identical" || mode == "backup" || mode == "multiple-backups"
+			wantSkipped, wantComplete := 0, mode == "identical" || mode == "backup" || mode == "multiple-backups" || mode == "historical-backup"
 			switch mode {
 			case "identical":
 			case "missing-remote":
@@ -84,6 +84,9 @@ func TestVerifyDriveArtifactOwnershipAndNormalDifferences(t *testing.T) {
 						}
 						data[it.DocwsID] = []byte("old")
 						wantComplete = mode == "local-counterpart"
+					}
+					if mode == "historical-backup" {
+						wantSkipped++
 					}
 					items = append(items, it)
 					if owned && mode != "changed-etag" && mode != "changed-id" && mode != "changed-parent" && mode != "wrong-kind" && mode != "wrong-original" && mode != "local-counterpart" && mode != "pending-local-counterpart" {
