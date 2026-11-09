@@ -23,16 +23,22 @@ tested on Ubuntu Linux.
   - With `conflict: "both"` both versions are preserved.
   - Conflicting versions receive a timestamp suffix.
 
-- **Improved iCloud Drive folder scoping**
-  - Synchronisation can be limited to a specific iCloud Drive folder.
+- **Selected iCloud Drive folder mappings**
+  - Synchronisation can be limited to one legacy `drive_subfolder`, or to several
+    pre-existing iCloud Drive folders mapped to separate local directories with
+    `drive_subfolders`.
+  - Each mapping has its own conflict and deletion reconciliation while sharing one
+    authentication session, process, and sync state.
 
-  Example:
+  Legacy single-folder example:
 
   ```json
   {
     "drive_subfolder": "ExampleBackups"
   }
   ```
+
+  For several folders, see [Multiple independent Drive folders](#multiple-independent-drive-folders).
 
 A daemon for Ubuntu (Go, no CGO) that keeps a local folder in sync with iCloud:
 
