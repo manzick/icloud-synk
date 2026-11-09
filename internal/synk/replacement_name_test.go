@@ -36,6 +36,8 @@ func TestReplacementSiblingNameIsRecognized(t *testing.T) {
 		".config",
 		"README",
 		"bericht.txt",
+		"report.release.v2.json",
+		"archive.tar.gz",
 	}
 
 	kinds := []string{"new", "backup", "failed"}

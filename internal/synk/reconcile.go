@@ -219,9 +219,14 @@ func localChanged(l LocalFile, st Entry, hasS bool) bool {
 }
 
 // remoteChanged reports whether the iCloud item differs from what we recorded.
-// ETag is the primary signal; size is a secondary signal if the ETag is unchanged.
+// Known identity changes are changes even if ETags and sizes happen to match.
 func remoteChanged(r icloud.Item, st Entry, hasS bool) bool {
 	if !hasS {
+		return true
+	}
+	if (st.DrivewsID != "" && r.DrivewsID != st.DrivewsID) ||
+		(st.DocwsID != "" && r.DocwsID != st.DocwsID) ||
+		(st.Zone != "" && r.Zone != st.Zone) {
 		return true
 	}
 	if st.Etag == "" {

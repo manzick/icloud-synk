@@ -11,8 +11,13 @@ import (
 	"time"
 )
 
-// Config is the on-disk configuration. Every field has a usable default so an
-// empty file still yields a working setup once target_dir is filled in.
+// DriveMapping connects an existing remote folder to a destination below Drive/.
+type DriveMapping struct {
+	Remote string `json:"remote"`
+	Local  string `json:"local"`
+}
+
+// Config is the on-disk configuration, loaded over Defaults.
 type Config struct {
 	AppleID string `json:"apple_id"`
 
@@ -21,7 +26,8 @@ type Config struct {
 
 	// DriveSubfolder limits Drive sync to a relative path inside iCloud Drive.
 	// Empty means the entire iCloud Drive (the original behaviour).
-	DriveSubfolder string `json:"drive_subfolder"`
+	DriveSubfolder  string         `json:"drive_subfolder"`
+	DriveSubfolders []DriveMapping `json:"drive_subfolders,omitempty"`
 
 	// ProtectDeletions leaves one-sided absences untouched when the path was synced before.
 	ProtectDeletions bool `json:"protect_deletions"`
@@ -48,6 +54,10 @@ type Config struct {
 
 	// Conflict is one of "both" (keep both versions), "newer", "remote".
 	Conflict string `json:"conflict"`
+
+	// BackupRetention limits proven, completed replacement backups per file.
+	// -1 retains all; 0 trashes backups after verification; positive values keep N.
+	BackupRetention int `json:"backup_retention"`
 
 	// MaxFileSize skips files larger than this many bytes (0 = no limit).
 	MaxFileSize int64 `json:"max_file_size"`
@@ -103,6 +113,7 @@ func Defaults() *Config {
 		DeleteLocal:      true,
 		ProtectDeletions: true,
 		Conflict:         "both",
+		BackupRetention:  -1,
 		Notify:           true,
 		Exclude: []string{
 			".icloud-synk", ".DS_Store", "*.part", "*.crdownload", "*.partial",
@@ -189,6 +200,9 @@ func (c *Config) Validate() error {
 		return err
 	}
 	c.TargetDir = abs
+	if err := c.ValidateDriveMappings(); err != nil {
+		return err
+	}
 	if c.DriveSubfolder != "" {
 		if strings.HasPrefix(c.DriveSubfolder, "/") || strings.Contains(c.DriveSubfolder, "\\") {
 			return fmt.Errorf("drive_subfolder must be a relative iCloud Drive path using '/' separators")
@@ -198,6 +212,9 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("drive_subfolder contains an invalid path component %q", part)
 			}
 		}
+	}
+	if c.BackupRetention < -1 {
+		return fmt.Errorf("backup_retention must be -1, 0, or a positive integer")
 	}
 	if c.Workers < 1 {
 		c.Workers = 1
@@ -217,7 +234,9 @@ func (c *Config) Validate() error {
 }
 
 // DriveDir is the local root of the two-way Drive mirror.
-func (c *Config) DriveDir() string { return filepath.Join(c.TargetDir, "Drive") }
+func (c *Config) DriveDir() string {
+	return filepath.Join(c.TargetDir, "Drive")
+}
 
 // PhotosDir is the local root of the (download-only) photo library.
 func (c *Config) PhotosDir() string { return filepath.Join(c.TargetDir, "Photos") }
@@ -230,3 +249,37 @@ func (c *Config) TrashDir() string { return filepath.Join(c.MetaDir(), "trash") 
 
 // StatePath is the sync state database.
 func (c *Config) StatePath() string { return filepath.Join(c.MetaDir(), "state.json") }
+
+// ValidateDriveMappings also runs at engine boundaries for programmatic callers.
+func (c *Config) ValidateDriveMappings() error {
+	if c.DriveSubfolders == nil {
+		return nil
+	}
+	if c.DriveSubfolder != "" {
+		return fmt.Errorf("drive_subfolder and drive_subfolders are mutually exclusive")
+	}
+	if len(c.DriveSubfolders) == 0 {
+		return fmt.Errorf("drive_subfolders must contain at least one mapping")
+	}
+	for i, m := range c.DriveSubfolders {
+		for _, p := range []string{m.Remote, m.Local} {
+			if p == "" || strings.ContainsAny(p, "\\:\x00") || strings.HasPrefix(p, "/") {
+				return fmt.Errorf("drive_subfolders[%d]: paths must be nonempty relative paths using '/' separators", i)
+			}
+			for _, part := range strings.Split(p, "/") {
+				if part == "" || part == "." || part == ".." || strings.TrimSpace(part) != part {
+					return fmt.Errorf("drive_subfolders[%d]: invalid path component %q", i, part)
+				}
+			}
+		}
+		for _, previous := range c.DriveSubfolders[:i] {
+			for _, pair := range [][2]string{{m.Local, previous.Local}, {m.Remote, previous.Remote}} {
+				a, b := strings.ToLower(pair[0]), strings.ToLower(pair[1])
+				if a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/") {
+					return fmt.Errorf("drive_subfolders: duplicate or overlapping paths %q and %q", pair[0], pair[1])
+				}
+			}
+		}
+	}
+	return nil
+}

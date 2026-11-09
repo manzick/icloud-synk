@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/kolesnikav/icloud-synk/internal/config"
 )
 
 const stateVersion = 1
@@ -55,11 +57,13 @@ type State struct {
 }
 
 type stateFile struct {
-	Version  int                    `json:"version"`
-	Updated  time.Time              `json:"updated,omitzero"`
-	Drive    map[string]*Entry      `json:"drive"`
-	Photos   map[string]*PhotoEntry `json:"photos"`
-	SyncedAt time.Time              `json:"synced_at,omitzero"`
+	Mappings  []config.DriveMapping          `json:"drive_mappings,omitempty"`
+	Version   int                            `json:"version"`
+	Updated   time.Time                      `json:"updated,omitzero"`
+	Drive     map[string]*Entry              `json:"drive"`
+	Photos    map[string]*PhotoEntry         `json:"photos"`
+	Artifacts map[string]ReplacementArtifact `json:"replacement_artifacts,omitempty"`
+	SyncedAt  time.Time                      `json:"synced_at,omitzero"`
 }
 
 // LoadState reads the state file, tolerating a missing one.
@@ -203,6 +207,7 @@ func (s *State) Save() error {
 	}
 
 	revision := s.revision
+	mapped := len(s.data.Mappings) > 0
 	s.data.Updated = time.Now()
 	raw, err := json.Marshal(&s.data)
 	s.mu.Unlock()
@@ -211,16 +216,39 @@ func (s *State) Save() error {
 	}
 
 	dir := filepath.Dir(s.path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	// Mapped states use the same confinement as Drive writes. Keep the root
+	// open through the atomic rename so replacing metadata paths cannot escape.
+	var confined *Engine
+	if mapped {
+		base := filepath.Dir(dir)
+		root, err := os.OpenRoot(base)
+		if err != nil {
+			return err
+		}
+		defer root.Close()
+		confined = &Engine{fs: &mappedFS{root: root, base: base}}
+	}
+	mkdirAll := os.MkdirAll
+	createTemp := os.CreateTemp
+	remove := os.Remove
+	rename := os.Rename
+	if confined != nil {
+		mkdirAll = confined.mkdirAll
+		createTemp = confined.createTemp
+		remove = confined.remove
+		rename = confined.rename
+	}
+
+	if err := mkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 
-	f, err := os.CreateTemp(dir, ".state-*.tmp")
+	f, err := createTemp(dir, ".state-*.tmp")
 	if err != nil {
 		return err
 	}
 	tmp := f.Name()
-	defer os.Remove(tmp)
+	defer remove(tmp)
 
 	if _, err := f.Write(raw); err != nil {
 		_ = f.Close()
@@ -229,10 +257,8 @@ func (s *State) Save() error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Chmod(tmp, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, s.path); err != nil {
+
+	if err := rename(tmp, s.path); err != nil {
 		return err
 	}
 

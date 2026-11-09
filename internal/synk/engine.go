@@ -45,17 +45,13 @@ type Engine struct {
 
 	scanner *Scanner
 	dryRun  bool
+	fs      *mappedFS
 
 	// remoteDirs maps a relative path (""=root) to its folder item, and is
 	// rebuilt on every pass. Uploads need the parent's docwsid, and workers
 	// may create folders concurrently, hence the mutex.
 	dirMu      sync.Mutex
 	remoteDirs map[string]icloud.Item
-
-	// stale holds folders that were uploaded into and whose etags must be
-	// re-read before the pass ends.
-	staleMu sync.Mutex
-	stale   map[string]struct{}
 
 	// replacementSkipLogged prevents repeated log messages for retained
 	// internal replacement files during the lifetime of this engine.
@@ -72,36 +68,59 @@ func NewEngine(cfg *config.Config, cl *icloud.Client, st *State, log *slog.Logge
 
 // Stats summarises a pass.
 type Stats struct {
-	Downloaded int
-	Uploaded   int
-	Created    int
-	TrashedLoc int
-	TrashedRem int
-	Conflicts  int
-	Skipped    int
-	Errors     int
-	Bytes      int64
+	Downloaded    int
+	Uploaded      int
+	Created       int
+	TrashedLoc    int
+	TrashedRem    int
+	Conflicts     int
+	Skipped       int
+	Errors        int
+	CleanupErrors int // non-fatal retention failures; successful transfers stay successful
+	Bytes         int64
 }
 
 func (s Stats) String() string {
-	return fmt.Sprintf("↓%d ↑%d +%d 🗑%d/%d ⚡%d ⚠%d",
-		s.Downloaded, s.Uploaded, s.Created, s.TrashedLoc, s.TrashedRem, s.Conflicts, s.Errors)
+	return fmt.Sprintf("↓%d ↑%d +%d 🗑%d/%d ⚡%d ⚠%d cleanup_errors=%d",
+		s.Downloaded, s.Uploaded, s.Created, s.TrashedLoc, s.TrashedRem, s.Conflicts, s.Errors, s.CleanupErrors)
 }
 
 // Empty reports whether the pass changed nothing.
 func (s Stats) Empty() bool {
-	return s.Downloaded+s.Uploaded+s.Created+s.TrashedLoc+s.TrashedRem+s.Errors == 0
+	return s.Downloaded+s.Uploaded+s.Created+s.TrashedLoc+s.TrashedRem+s.Errors+s.CleanupErrors == 0
 }
 
 // EnsureDirs creates the local layout.
 func (e *Engine) EnsureDirs() error {
+	if e.cfg.DriveSubfolders != nil && e.fs == nil {
+		if err := e.cfg.ValidateDriveMappings(); err != nil {
+			return err
+		}
+		if err := noSymlinkTree(e.cfg.DriveDir()); err != nil {
+			return err
+		}
+		if err := noSymlinkTree(e.cfg.MetaDir()); err != nil {
+			return err
+		}
+		if err := os.MkdirAll(e.cfg.TargetDir, 0o755); err != nil {
+			return err
+		}
+		root, err := os.OpenRoot(e.cfg.TargetDir)
+		if err != nil {
+			return err
+		}
+		defer root.Close()
+		view := &Engine{cfg: e.cfg, fs: &mappedFS{root: root, base: e.cfg.TargetDir}}
+		return view.EnsureDirs()
+	}
+
 	for _, d := range []string{e.cfg.DriveDir(), e.cfg.MetaDir()} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
+		if err := e.mkdirAll(d, 0o755); err != nil {
 			return err
 		}
 	}
 	if e.cfg.SyncPhotos {
-		if err := os.MkdirAll(e.cfg.PhotosDir(), 0o755); err != nil {
+		if err := e.mkdirAll(e.cfg.PhotosDir(), 0o755); err != nil {
 			return err
 		}
 	}
@@ -110,12 +129,44 @@ func (e *Engine) EnsureDirs() error {
 
 // SyncDrive runs one full Drive pass: scan, list, reconcile, apply.
 func (e *Engine) SyncDrive(ctx context.Context) (Stats, error) {
+	if e.cfg.DriveSubfolders == nil {
+		return e.syncDrive(ctx)
+	}
+	if err := e.cfg.ValidateDriveMappings(); err != nil {
+		return Stats{}, err
+	}
+	if err := noSymlinkTree(e.cfg.DriveDir()); err != nil {
+		return Stats{}, err
+	}
+	if err := noSymlinkTree(e.cfg.MetaDir()); err != nil {
+		return Stats{}, err
+	}
+	if err := os.MkdirAll(e.cfg.TargetDir, 0o755); err != nil {
+		return Stats{}, err
+	}
+	root, err := os.OpenRoot(e.cfg.TargetDir)
+	if err != nil {
+		return Stats{}, err
+	}
+	defer root.Close()
+	view := &Engine{cfg: e.cfg, cl: e.cl, st: e.st, log: e.log, dryRun: e.dryRun, scanner: e.scanner, fs: &mappedFS{root: root, base: e.cfg.TargetDir}}
+	return view.syncDrive(ctx)
+}
+
+func (e *Engine) syncDrive(ctx context.Context) (Stats, error) {
 	var stats Stats
+
 	if err := e.EnsureDirs(); err != nil {
 		return stats, err
 	}
 
-	local, skipped, oversized, err := e.scanner.Scan()
+	if err := e.cfg.ValidateDriveMappings(); err != nil {
+		return stats, err
+	}
+	if err := e.st.checkMappings(e.cfg, false); err != nil {
+		return stats, err
+	}
+	local, skipped, oversized, err := e.scanMappings()
 	if err != nil {
 		return stats, fmt.Errorf("scanning %s: %w", e.cfg.DriveDir(), err)
 	}
@@ -129,7 +180,7 @@ func (e *Engine) SyncDrive(ctx context.Context) (Stats, error) {
 		e.log.Warn("protecting oversized local file from reconciliation actions", "path", p)
 	}
 
-	remoteFiles, remoteDirs, err := e.fetchRemote(ctx)
+	remoteFiles, remoteDirs, err := e.fetchMappings(ctx)
 	if err != nil {
 		return stats, err
 	}
@@ -140,7 +191,7 @@ func (e *Engine) SyncDrive(ctx context.Context) (Stats, error) {
 		remote[k] = v
 	}
 	for k, v := range remoteDirs {
-		if k == "" {
+		if k == "" || e.mappingRoot(k) {
 			continue // the root itself is not an entry
 		}
 		remote[k] = v
@@ -169,8 +220,25 @@ func (e *Engine) SyncDrive(ctx context.Context) (Stats, error) {
 		return stats, nil
 	}
 
+	if err := e.st.checkMappings(e.cfg, true); err != nil {
+		return stats, err
+	}
+	if e.cfg.DriveSubfolders != nil {
+		if err := e.st.Save(); err != nil {
+			return stats, fmt.Errorf("persisting mapping bindings: %w", err)
+		}
+	}
+	// Root directories are mounting points, never reconciled or uploaded.
+	for _, m := range e.cfg.DriveSubfolders {
+		if err := e.mkdirAll(e.localPath(m.Local), 0o755); err != nil {
+			return stats, err
+		}
+	}
 	stats = e.apply(ctx, ops)
 	if err := e.st.Save(); err != nil {
+		if e.cfg.DriveSubfolders != nil {
+			return stats, err
+		}
 		e.log.Warn("saving state", "err", err)
 	}
 	return stats, nil
@@ -195,6 +263,8 @@ func (e *Engine) fetchRemote(ctx context.Context) (files, dirs map[string]icloud
 		dirs[""] = root
 	}
 	pending := map[string]string{rootID: ""}
+	visited := map[string]string{rootID: ""}
+	seenPaths := map[string]string{}
 
 	for len(pending) > 0 {
 		if err := ctx.Err(); err != nil {
@@ -234,7 +304,15 @@ func (e *Engine) fetchRemote(ctx context.Context) (files, dirs map[string]icloud
 				if e.scanner.IsExcluded(rel) {
 					continue
 				}
+				if previous, ok := seenPaths[rel]; ok {
+					return nil, nil, fmt.Errorf("ambiguous remote path %q (%s and %s)", rel, previous, it.DrivewsID)
+				}
+				seenPaths[rel] = it.DrivewsID
 				if it.IsDir() {
+					if previous, ok := visited[it.DrivewsID]; ok {
+						return nil, nil, fmt.Errorf("remote folder cycle or alias at %q and %q", previous, rel)
+					}
+					visited[it.DrivewsID] = rel
 					dirs[rel] = it
 					next[it.DrivewsID] = rel
 					continue
@@ -271,7 +349,7 @@ func (e *Engine) resolveRemoteSubfolder(ctx context.Context, subfolder string) (
 		if err != nil {
 			return icloud.Item{}, fmt.Errorf("locating iCloud Drive folder %q: %w", subfolder, err)
 		}
-		found := false
+		matches := 0
 		for _, folder := range folders {
 			if folder.DrivewsID != currentID {
 				continue
@@ -280,15 +358,14 @@ func (e *Engine) resolveRemoteSubfolder(ctx context.Context, subfolder string) (
 				if sanitizeName(item.FullName()) == component && item.IsDir() {
 					current = item
 					currentID = item.DrivewsID
-					found = true
-					break
+					matches++
 				}
 			}
-			if found {
-				break
-			}
 		}
-		if !found {
+		if matches > 1 {
+			return icloud.Item{}, fmt.Errorf("configured iCloud Drive folder %q is ambiguous", subfolder)
+		}
+		if matches == 0 {
 			return icloud.Item{}, fmt.Errorf("configured iCloud Drive folder %q was not found (missing folder %q); refusing to sync", subfolder, component)
 		}
 	}
@@ -338,7 +415,7 @@ func (e *Engine) apply(ctx context.Context, ops []Op) Stats {
 				stats.Created++
 				continue
 			}
-			if err := os.MkdirAll(e.localPath(op.Path), 0o755); err != nil {
+			if err := e.mkdirAll(e.localPath(op.Path), 0o755); err != nil {
 				e.log.Error("creating local directory", "path", op.Path, "err", err)
 				stats.Errors++
 				continue
@@ -418,8 +495,8 @@ func (e *Engine) apply(ctx context.Context, ops []Op) Stats {
 	stats.TrashedRem += trashed
 	stats.Errors += trashErrs
 
-	if err := e.refreshEtags(ctx); err != nil {
-		e.log.Debug("refreshing etags", "err", err)
+	if err := e.cleanupBackups(ctx); err != nil {
+		stats.CleanupErrors++
 	}
 	return stats
 }
@@ -429,6 +506,7 @@ func (s *Stats) add(o Stats) {
 	s.Uploaded += o.Uploaded
 	s.Conflicts += o.Conflicts
 	s.Errors += o.Errors
+	s.CleanupErrors += o.CleanupErrors
 	s.Bytes += o.Bytes
 	s.Skipped += o.Skipped
 }
@@ -531,18 +609,18 @@ func (e *Engine) localPath(rel string) string {
 // download writes the remote file atomically and records the result.
 func (e *Engine) download(ctx context.Context, op Op, passStamp string) (int64, error) {
 	dst := e.localPath(op.Path)
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	if err := e.mkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return 0, err
 	}
 
-	tmp, err := os.CreateTemp(filepath.Dir(dst), ".icloud-synk-*.part")
+	tmp, err := e.createTemp(filepath.Dir(dst), ".icloud-synk-*.part")
 	if err != nil {
 		return 0, err
 	}
 	tmpName := tmp.Name()
 	defer func() {
 		tmp.Close()
-		os.Remove(tmpName)
+		e.remove(tmpName)
 	}()
 
 	h := sha256.New()
@@ -568,9 +646,9 @@ func (e *Engine) download(ctx context.Context, op Op, passStamp string) (int64, 
 		if prev, ok := e.st.Drive()[op.Path]; ok &&
 			prev.SHA256 != "" &&
 			prev.SHA256 == remoteHash {
-			info, statErr := os.Stat(dst)
+			info, statErr := e.stat(dst)
 			if statErr == nil && info.Mode().IsRegular() {
-				localHash, hashErr := fileSHA256(dst)
+				localHash, hashErr := e.hashFile(dst)
 				if hashErr == nil && localHash == remoteHash {
 					e.st.PutDrive(op.Path, Entry{
 						Size:        info.Size(),
@@ -591,7 +669,7 @@ func (e *Engine) download(ctx context.Context, op Op, passStamp string) (int64, 
 	// Preserve the local version only after confirming the remote content
 	// differs and the download has completed successfully.
 	// Prepare the downloaded file before touching the existing local file.
-	if err := os.Chmod(tmpName, 0o644); err != nil {
+	if err := e.chmod(tmpName, 0o644); err != nil {
 		return 0, err
 	}
 
@@ -602,7 +680,7 @@ func (e *Engine) download(ctx context.Context, op Op, passStamp string) (int64, 
 		switch e.cfg.Conflict {
 		case "both":
 			var err error
-			backupPath, err = createConflictCopy(dst, conflictPath(dst, passStamp))
+			backupPath, err = e.createConflictCopy(dst, conflictPath(dst, passStamp))
 			if err != nil && !os.IsNotExist(err) {
 				return 0, fmt.Errorf("preserving local conflict version: %w", err)
 			}
@@ -614,24 +692,24 @@ func (e *Engine) download(ctx context.Context, op Op, passStamp string) (int64, 
 		}
 
 		if backupPath != "" && e.cfg.Conflict != "both" {
-			if err := renameFile(dst, backupPath); err != nil && !os.IsNotExist(err) {
+			if err := e.rename(dst, backupPath); err != nil && !os.IsNotExist(err) {
 				return 0, fmt.Errorf("preserving local conflict version: %w", err)
 			}
 		}
 	}
 
-	if err := renameFile(tmpName, dst); err != nil {
+	if err := e.rename(tmpName, dst); err != nil {
 		// If replacement failed, restore the original file when possible.
 		if backupPath != "" {
 			if e.cfg.Conflict == "both" {
 				// The original remains at dst; remove only the extra hard link.
-				if removeErr := os.Remove(backupPath); removeErr != nil && !os.IsNotExist(removeErr) {
+				if removeErr := e.remove(backupPath); removeErr != nil && !os.IsNotExist(removeErr) {
 					return 0, fmt.Errorf(
 						"replacing downloaded file failed: %v; removing temporary conflict copy failed: %w",
 						err, removeErr,
 					)
 				}
-			} else if restoreErr := renameFile(backupPath, dst); restoreErr != nil {
+			} else if restoreErr := e.rename(backupPath, dst); restoreErr != nil {
 				return 0, fmt.Errorf(
 					"replacing downloaded file failed: %v; restoring original file failed: %w",
 					err, restoreErr,
@@ -649,7 +727,7 @@ func (e *Engine) download(ctx context.Context, op Op, passStamp string) (int64, 
 				"as", filepath.Base(backupPath),
 			)
 		} else if e.cfg.Conflict == "remote" {
-			if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
+			if err := e.remove(backupPath); err != nil && !os.IsNotExist(err) {
 				e.log.Warn(
 					"could not remove temporary conflict backup",
 					"path", backupPath,
@@ -663,10 +741,10 @@ func (e *Engine) download(ctx context.Context, op Op, passStamp string) (int64, 
 	if mtime.IsZero() {
 		mtime = time.Now()
 	}
-	if err := os.Chtimes(dst, mtime, mtime); err != nil {
+	if err := e.setTimes(dst, mtime); err != nil {
 		e.log.Debug("setting mtime", "path", op.Path, "err", err)
 	}
-	info, err := os.Stat(dst)
+	info, err := e.stat(dst)
 	if err != nil {
 		return n, err
 	}
@@ -686,14 +764,14 @@ func (e *Engine) download(ctx context.Context, op Op, passStamp string) (int64, 
 // upload sends a local file to iCloud, creating parent folders as needed.
 func (e *Engine) upload(ctx context.Context, op Op, passStamp string) (int64, error) {
 	src := e.localPath(op.Path)
-	info, err := os.Stat(src)
+	info, err := e.stat(src)
 	if err != nil {
 		return 0, err
 	}
 
 	// Skip files that only got their timestamp touched.
 	if prev, ok := e.st.Drive()[op.Path]; ok && prev.SHA256 != "" && prev.Size == info.Size() {
-		sum, hashErr := fileSHA256(src)
+		sum, hashErr := e.hashFile(src)
 		if hashErr == nil && sum == prev.SHA256 {
 			prev.LocalMTime = info.ModTime()
 			e.st.PutDrive(op.Path, prev)
@@ -719,15 +797,21 @@ func (e *Engine) upload(ctx context.Context, op Op, passStamp string) (int64, er
 		return 0, err
 	}
 
-	f, err := os.Open(src)
+	// Upload an immutable snapshot, including on retries. Never associate a
+	// later local edit with the bytes sent to iCloud.
+	f, err := e.snapshotUpload(src, info)
 	if err != nil {
 		return 0, err
 	}
+	defer os.Remove(f.Name())
 	defer f.Close()
+	expectedHash, err := fileSHA256(f.Name())
+	if err != nil {
+		return 0, err
+	}
 
 	h := sha256.New()
 	name := path.Base(op.Path)
-	prev := e.st.Drive()[op.Path]
 
 	// Only enter replacement mode when reconciliation identified an existing
 	// remote file at this exact path. Refresh its metadata before renaming it.
@@ -738,6 +822,10 @@ func (e *Engine) upload(ctx context.Context, op Op, passStamp string) (int64, er
 			return 0, fmt.Errorf("listing remote parent before replacement: %w", listErr)
 		}
 		if item := findRemoteItem(items, name); item != nil {
+			if remoteChanged(*item, Entry{Etag: op.Remote.Etag, Size: op.Remote.Size,
+				DrivewsID: op.Remote.DrivewsID, DocwsID: op.Remote.DocwsID, Zone: op.Remote.Zone}, true) {
+				return 0, fmt.Errorf("cannot safely replace %q: remote file changed since reconciliation", op.Path)
+			}
 			copy := *item
 			existing = &copy
 		} else {
@@ -800,26 +888,44 @@ func (e *Engine) upload(ctx context.Context, op Op, passStamp string) (int64, er
 		return 0, uploadErr
 	}
 
+	if hex.EncodeToString(h.Sum(nil)) != expectedHash {
+		return 0, fmt.Errorf("upload of %q did not consume the complete snapshot; remote versions retained", op.Path)
+	}
 	var remoteAfter *icloud.Item
+	var retainedBackup *icloud.Item
 	if existing != nil {
-		expectedHash := hex.EncodeToString(h.Sum(nil))
-
 		// Confirm the temporary upload and its content before touching the old
 		// file. On every failure, leave all remote versions in place.
 		tempItem, err := e.findRemoteItemRetry(ctx, parent, uploadName)
 		if err != nil {
 			return 0, fmt.Errorf("temporary upload for %q was not confirmed; existing file retained: %w", op.Path, err)
 		}
-		if err := e.verifyRemoteHash(ctx, *tempItem, expectedHash); err != nil {
+		if err := e.verifyUploadedItem(ctx, *tempItem, expectedHash, info.Size()); err != nil {
 			return 0, fmt.Errorf("temporary upload for %q failed content verification; existing file retained: %w", op.Path, err)
 		}
 
+		// Persist proven temporary identity before moving the recoverable old
+		// version. Unfinished records remain protected across restarts.
+		if err := e.recordArtifact(op.Path, parent, *tempItem, "new"); err != nil {
+			return 0, err
+		}
 		backupName := replacementSiblingName(name, "backup", stamp)
+		children, err := e.remoteChildren(ctx, parent)
+		if err != nil {
+			return 0, err
+		}
+		if findRemoteItem(children, backupName) != nil {
+			return 0, fmt.Errorf("backup name already exists; refusing replacement of %q", op.Path)
+		}
 		backupItem, err := e.renameRemoteAndConfirm(ctx, parent, *existing, backupName)
 		if err != nil {
 			return 0, fmt.Errorf("could not confirm backup of %q; remote versions were retained where possible: %w", op.Path, err)
 		}
 
+		if err := e.recordArtifact(op.Path, parent, backupItem, "backup"); err != nil {
+			return 0, err
+		}
+		retainedBackup = &backupItem
 		target, err := e.renameRemoteAndConfirm(ctx, parent, *tempItem, name)
 		if err != nil {
 			// Restore the old name only if the target name is currently absent.
@@ -836,7 +942,7 @@ func (e *Engine) upload(ctx context.Context, op Op, passStamp string) (int64, er
 			return 0, fmt.Errorf("new version could not be confirmed at original name %q; backup %q retained: %w", op.Path, backupName, err)
 		}
 
-		if verifyErr := e.verifyRemoteHash(ctx, target, expectedHash); verifyErr != nil {
+		if verifyErr := e.verifyUploadedItem(ctx, target, expectedHash, info.Size()); verifyErr != nil {
 			// Preserve the unverified new version under a separate name before
 			// restoring the old version to the original path.
 			failedName := replacementSiblingName(name, "failed", stamp)
@@ -848,6 +954,9 @@ func (e *Engine) upload(ctx context.Context, op Op, passStamp string) (int64, er
 					op.Path, backupName, verifyErr)
 			}
 
+			if err := e.recordArtifact(op.Path, parent, failedItem, "failed"); err != nil {
+				e.log.Warn("could not persist failed replacement identity; artifact retained", "path", op.Path, "err", err)
+			}
 			items, listErr := e.remoteChildren(ctx, parent)
 			if listErr != nil {
 				e.log.Error("could not list remote folder before restoring backup",
@@ -883,25 +992,96 @@ func (e *Engine) upload(ctx context.Context, op Op, passStamp string) (int64, er
 			"path", op.Path, "backup", backupItem.FullName())
 	}
 
-	// The new etag is unknown until the folder is re-listed; refreshEtags does
-	// that once per pass. Keep the previous ids so the entry stays usable.
-	drivewsID, docwsID := prev.DrivewsID, prev.DocwsID
-	if remoteAfter != nil {
-		drivewsID = remoteAfter.DrivewsID
-		docwsID = remoteAfter.DocwsID
+	if remoteAfter == nil {
+		// Creation has no verified target yet. Complete only this file's
+		// metadata, and verify its content before advancing the baseline.
+		target, err := e.findRemoteItemRetry(ctx, parent, name)
+		if err != nil {
+			return 0, fmt.Errorf("upload of %q succeeded but metadata confirmation is incomplete; remote file retained: %w", op.Path, err)
+		}
+		if err := e.verifyUploadedItem(ctx, *target, expectedHash, info.Size()); err != nil {
+			return 0, fmt.Errorf("upload of %q could not be verified; remote file retained: %w", op.Path, err)
+		}
+		remoteAfter = target
+	}
+
+	// Preserve the previous baseline if the source changed while uploading.
+	// The remote versions remain intact; the next pass can reconcile safely.
+	current, err := e.stat(src)
+	if err != nil {
+		return 0, fmt.Errorf("checking local source after upload: %w", err)
+	}
+	localHash, err := e.hashFile(src)
+	if err != nil {
+		return 0, err
+	}
+	if !os.SameFile(info, current) || current.Size() != info.Size() ||
+		!current.ModTime().Equal(info.ModTime()) || localHash != expectedHash {
+		return 0, fmt.Errorf("local file %q changed during upload; previous sync state and remote versions retained", op.Path)
 	}
 	e.st.PutDrive(op.Path, Entry{
-		Size:        info.Size(),
+		Size:        remoteAfter.Size,
 		LocalMTime:  info.ModTime(),
-		SHA256:      hex.EncodeToString(h.Sum(nil)),
-		Etag:        "", // refreshed below
-		DrivewsID:   drivewsID,
-		DocwsID:     docwsID,
-		Zone:        parent.Zone,
-		RemoteMTime: info.ModTime(),
+		SHA256:      expectedHash,
+		Etag:        remoteAfter.Etag,
+		DrivewsID:   remoteAfter.DrivewsID,
+		DocwsID:     remoteAfter.DocwsID,
+		Zone:        remoteAfter.Zone,
+		RemoteMTime: remoteAfter.ModTime(),
 	})
-	e.markStale(parentRel)
+	if retainedBackup != nil {
+		a := e.st.Artifacts()[retainedBackup.DrivewsID]
+		a.Complete = true
+		e.st.putArtifact(a)
+		e.st.deleteArtifact(remoteAfter.DrivewsID)
+		if err := e.st.Save(); err != nil {
+			a.Complete = false
+			e.st.putArtifact(a)
+			return 0, fmt.Errorf("saving completed replacement; backups retained: %w", err)
+		}
+	}
 	return info.Size(), nil
+}
+
+// snapshotUpload captures the bytes and rejects observable source changes during
+// the copy. The caller owns closing and removing the private temporary file.
+func (e *Engine) snapshotUpload(src string, info os.FileInfo) (*os.File, error) {
+	in, err := e.open(src)
+	if err != nil {
+		return nil, err
+	}
+	defer in.Close()
+	opened, err := in.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) ||
+		opened.Size() != info.Size() || !opened.ModTime().Equal(info.ModTime()) {
+		return nil, fmt.Errorf("local source %q changed before upload", src)
+	}
+	out, err := os.CreateTemp("", "icloud-synk-upload-*")
+	if err != nil {
+		return nil, err
+	}
+	n, copyErr := io.Copy(out, in)
+	after, statErr := in.Stat()
+	if copyErr != nil || statErr != nil || n != info.Size() ||
+		!after.ModTime().Equal(info.ModTime()) || after.Size() != info.Size() {
+		out.Close()
+		os.Remove(out.Name())
+		return nil, fmt.Errorf("snapshotting local source %q failed or source changed: %w", src,
+			errors.Join(copyErr, statErr, errors.New("snapshot incomplete or unstable")))
+	}
+	return out, nil
+}
+
+// verifyUploadedItem never treats a name match alone as upload confirmation.
+func (e *Engine) verifyUploadedItem(ctx context.Context, item icloud.Item, expectedHash string, size int64) error {
+	if item.Type != icloud.TypeFile || item.ItemCount != 0 || item.DrivewsID == "" ||
+		item.DocwsID == "" || item.Etag == "" || item.Zone == "" || item.Size != size {
+		return fmt.Errorf("incomplete or inconsistent uploaded file metadata for %q", item.FullName())
+	}
+	return e.verifyRemoteHash(ctx, item, expectedHash)
 }
 
 // remoteChildren returns the direct children of a remote folder.
@@ -1058,14 +1238,14 @@ func (e *Engine) renameRemoteAndConfirm(ctx context.Context, parent icloud.Item,
 
 // downloadTo fetches a remote item into an explicit local path.
 func (e *Engine) downloadTo(ctx context.Context, item icloud.Item, dst string) error {
-	f, err := os.CreateTemp(filepath.Dir(dst), ".icloud-synk-*.part")
+	f, err := e.createTemp(filepath.Dir(dst), ".icloud-synk-*.part")
 	if err != nil {
 		return err
 	}
 	tmpName := f.Name()
 	defer func() {
 		f.Close()
-		os.Remove(tmpName)
+		e.remove(tmpName)
 	}()
 	if _, err := e.cl.Download(ctx, item, f); err != nil {
 		return err
@@ -1073,7 +1253,7 @@ func (e *Engine) downloadTo(ctx context.Context, item icloud.Item, dst string) e
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
+	if err := e.chmod(tmpName, 0o644); err != nil {
 		return err
 	}
 
@@ -1088,7 +1268,7 @@ func (e *Engine) downloadTo(ctx context.Context, item icloud.Item, dst string) e
 			candidate = filepath.Join(filepath.Dir(dst), fmt.Sprintf("%s (%d)%s", stem, i, ext))
 		}
 
-		if err := os.Link(tmpName, candidate); err != nil {
+		if err := e.link(tmpName, candidate); err != nil {
 			if os.IsExist(err) {
 				continue
 			}
@@ -1112,6 +1292,23 @@ func (e *Engine) ensureRemoteDir(ctx context.Context, rel string) (icloud.Item, 
 			return icloud.Item{}, errors.New("iCloud Drive root is unknown")
 		}
 		return root, nil
+	}
+	if e.cfg.DriveSubfolders != nil {
+		allowed := false
+		for _, m := range e.cfg.DriveSubfolders {
+			if rel == m.Local || mappingContains(m, rel) {
+				allowed = true
+			}
+		}
+		if !allowed {
+			return icloud.Item{}, fmt.Errorf("path %q is outside configured mappings", rel)
+		}
+		if e.mappingRoot(rel) {
+			if it, ok := e.lookupDir(rel); ok {
+				return it, nil
+			}
+			return icloud.Item{}, fmt.Errorf("configured remote root %q is unknown; refusing to create it", rel)
+		}
 	}
 	if it, ok := e.lookupDir(rel); ok {
 		return it, nil
@@ -1218,92 +1415,27 @@ func (e *Engine) trashRemote(ctx context.Context, ops []Op) (done, errs int) {
 func (e *Engine) moveToLocalTrash(rel, stamp string) error {
 	src := e.localPath(rel)
 	dst := filepath.Join(e.cfg.TrashDir(), stamp, filepath.FromSlash(rel))
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+	if err := e.mkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return err
 	}
-	if err := os.Rename(src, dst); err != nil {
+	if err := e.rename(src, dst); err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		// A cross-device rename cannot happen inside one tree, but a busy file
 		// can still fail; fall back to copy+remove.
-		if copyErr := copyFile(src, dst); copyErr != nil {
+		if copyErr := e.copyFile(src, dst); copyErr != nil {
 			return err
 		}
-		return os.RemoveAll(src)
+		return e.removeAll(src)
 	}
 	return nil
 }
 
-// markStale notes a folder whose etags must be re-read after uploads.
-func (e *Engine) markStale(rel string) {
-	e.staleMu.Lock()
-	if e.stale == nil {
-		e.stale = map[string]struct{}{}
-	}
-	e.stale[rel] = struct{}{}
-	e.staleMu.Unlock()
-}
-
-// refreshEtags re-lists the folders we uploaded into, so the state holds the
-// etag iCloud assigned. Without it, the next pass would see a phantom change.
-func (e *Engine) refreshEtags(ctx context.Context) error {
-	e.staleMu.Lock()
-	stale := e.stale
-	e.stale = nil
-	e.staleMu.Unlock()
-
-	if len(stale) == 0 || e.dryRun {
-		return nil
-	}
-	byID := make(map[string]string, len(stale))
-	for rel := range stale {
-		if it, ok := e.lookupDir(rel); ok {
-			byID[it.DrivewsID] = rel
-		}
-	}
-	ids := make([]string, 0, len(byID))
-	for id := range byID {
-		ids = append(ids, id)
-	}
-	for len(ids) > 0 {
-		n := min(len(ids), folderBatch)
-		folders, err := e.cl.ListFolders(ctx, ids[:n])
-		if err != nil {
-			return err
-		}
-		ids = ids[n:]
-		for _, f := range folders {
-			rel := byID[f.DrivewsID]
-			for _, it := range f.Items {
-				if it.IsDir() {
-					continue
-				}
-				name := sanitizeName(it.FullName())
-				childRel := name
-				if rel != "" {
-					childRel = rel + "/" + name
-				}
-				prev, ok := e.st.Drive()[childRel]
-				if !ok {
-					continue
-				}
-				prev.Etag = it.Etag
-				prev.DrivewsID = it.DrivewsID
-				prev.DocwsID = it.DocwsID
-				prev.Zone = it.Zone
-				prev.RemoteMTime = it.ModTime()
-				e.st.PutDrive(childRel, prev)
-			}
-		}
-	}
-	return e.st.Save()
-}
-
 // createConflictCopy creates a hard link to src at a unique conflict filename.
 // It never replaces an existing destination and leaves src untouched.
-func createConflictCopy(src, preferred string) (string, error) {
-	if _, err := os.Stat(src); err != nil {
+func (e *Engine) createConflictCopy(src, preferred string) (string, error) {
+	if _, err := e.stat(src); err != nil {
 		return "", err
 	}
 
@@ -1316,7 +1448,7 @@ func createConflictCopy(src, preferred string) (string, error) {
 			candidate = filepath.Join(filepath.Dir(preferred), fmt.Sprintf("%s (%d)%s", stem, i, ext))
 		}
 
-		if err := os.Link(src, candidate); err != nil {
+		if err := e.link(src, candidate); err != nil {
 			if os.IsExist(err) {
 				continue
 			}
@@ -1335,13 +1467,13 @@ func conflictPath(p, stamp string) string {
 	return filepath.Join(dir, fmt.Sprintf("%s.conflict-%s%s", stem, stamp, ext))
 }
 
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
+func (e *Engine) copyFile(src, dst string) error {
+	in, err := e.open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.Create(dst)
+	out, err := e.createLocal(dst)
 	if err != nil {
 		return err
 	}

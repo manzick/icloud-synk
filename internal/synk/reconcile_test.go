@@ -124,7 +124,7 @@ func TestReconcileUnchangedFileDoesNothing(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	local := map[string]LocalFile{"a.txt": file("a.txt", 10, now)}
 	remote := map[string]icloud.Item{"a.txt": remoteFile("a.txt", "e1", 10, now)}
-	state := map[string]Entry{"a.txt": {Size: 10, LocalMTime: now, Etag: "e1", DrivewsID: "x"}}
+	state := map[string]Entry{"a.txt": {Size: 10, LocalMTime: now, Etag: "e1", DrivewsID: remote["a.txt"].DrivewsID}}
 
 	ops := Reconcile(local, remote, state, basePolicy)
 
@@ -138,7 +138,7 @@ func TestReconcileLocalEditUploads(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	local := map[string]LocalFile{"a.txt": file("a.txt", 99, now)}
 	remote := map[string]icloud.Item{"a.txt": remoteFile("a.txt", "e1", 10, old)}
-	state := map[string]Entry{"a.txt": {Size: 10, LocalMTime: old, Etag: "e1", DrivewsID: "x"}}
+	state := map[string]Entry{"a.txt": {Size: 10, LocalMTime: old, Etag: "e1", DrivewsID: remote["a.txt"].DrivewsID}}
 
 	ops := Reconcile(local, remote, state, basePolicy)
 
@@ -519,7 +519,7 @@ func TestReconcileUnchangedRemoteMetadataRecordsState(t *testing.T) {
 	state := map[string]Entry{
 		"a.txt": {
 			Size: 10, LocalMTime: now, Etag: "e1",
-			RemoteMTime: now, DrivewsID: "x",
+			RemoteMTime: now, DrivewsID: remote["a.txt"].DrivewsID,
 		},
 	}
 
@@ -543,7 +543,7 @@ func TestReconcileRemoteMTimeChangeWithUnchangedETagAndSizeRecordsState(t *testi
 	state := map[string]Entry{
 		"a.txt": {
 			Size: 10, LocalMTime: old, Etag: "e1",
-			RemoteMTime: old, DrivewsID: "x",
+			RemoteMTime: old, DrivewsID: remote["a.txt"].DrivewsID,
 		},
 	}
 

@@ -1,0 +1,12 @@
+.git
+.github
+bin
+build
+dist
+*.log
+*.env
+.env*
+**/session.json
+**/config.json
+**/state.json
+**/.icloud-synk
