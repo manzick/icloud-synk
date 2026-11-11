@@ -1,6 +1,22 @@
 # icloud-synk
 
-*In English: [README.md](README.md)*
+[![Go 1.25+](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![Linux](https://img.shields.io/badge/OS-Linux-FCC624?logo=linux&logoColor=black)](https://www.kernel.org/)
+[![Docker](https://img.shields.io/badge/Docker-supported-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
+[![Platforms](https://img.shields.io/badge/Platforms-amd64%20%7C%20arm64-555555)](#проверенные-окружения)
+
+[English](README.md) | Русский
+
+## Улучшения Manzick
+
+Этот форк основан на `icloud-synk` от MagicMartin67 и добавляет улучшения
+безопасности синхронизации, поддержку нескольких папок и возможность развёртывания
+через Docker.
+
+### Проверенные окружения
+
+Проект протестирован на Raspberry Pi 5 (ARM64) под управлением Raspberry Pi OS Lite,
+на Arch Linux и в Docker-развёртываниях.
 
 Демон для Ubuntu (Go, без CGO), который держит указанную папку синхронной с iCloud:
 
@@ -67,40 +83,20 @@
 
 ## Установка
 
-### Готовый бинарник (Go не нужен)
-
-К каждому [релизу](https://github.com/kolesnikav/icloud-synk/releases) приложены статические
-сборки без CGO для `linux/amd64` и `linux/arm64`:
+Сейчас проект устанавливается из исходников. Требуется Go 1.25+ для ограничения
+файловых операций корневым каталогом; зависимости — `fsnotify` и `x/sys`.
 
 ```bash
-curl -fsSL https://github.com/kolesnikav/icloud-synk/releases/latest/download/icloud-synk-linux-amd64.tar.gz \
-  | tar -xz --strip-components=1 -C /tmp icloud-synk-linux-amd64/icloud-synk
-install -Dm755 /tmp/icloud-synk ~/.local/bin/icloud-synk
-icloud-synk version
-```
-
-Внутри архива также лежат `icloud-synk.service` и оба README. Рядом с архивами есть
-`SHA256SUMS` для проверки:
-
-```bash
-sha256sum -c SHA256SUMS --ignore-missing
-```
-
-### Из исходников
-
-```bash
-git clone git@github.com:kolesnikav/icloud-synk.git && cd icloud-synk
+git clone git@github.com:manzick/icloud-synk.git && cd icloud-synk
 make build              # bin/icloud-synk
 make install            # ~/.local/bin/icloud-synk
 ```
 
-Либо напрямую через Go:
+Либо после клонирования репозитория установите напрямую через Go:
 
 ```bash
-go install github.com/kolesnikav/icloud-synk/cmd/icloud-synk@latest
+go install ./cmd/icloud-synk
 ```
-
-Требуется Go 1.25+ для ограничения файловых операций корневым каталогом. Зависимости: `fsnotify` и `x/sys`.
 
 ## Первый запуск
 
@@ -209,6 +205,9 @@ established`. Это не подтверждает владение файлом
   "password_command": ""
 }
 ```
+
+Дополнительные параметры форка, включая `protect_deletions` и `drive_subfolders`,
+описаны в разделе [«Несколько независимых папок Drive»](#несколько-независимых-папок-drive).
 
 * `delete_remote` — локальное удаление отправляет файл в корзину iCloud.
 * `delete_local` — удаление в iCloud переносит локальный файл в `.icloud-synk/trash/<дата>/`.

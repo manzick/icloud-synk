@@ -1,11 +1,21 @@
 # icloud-synk
 
-*По-русски: [README_RU.md](README_RU.md)*
+[![Go 1.25+](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![Linux](https://img.shields.io/badge/OS-Linux-FCC624?logo=linux&logoColor=black)](https://www.kernel.org/)
+[![Docker](https://img.shields.io/badge/Docker-supported-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
+[![Platforms](https://img.shields.io/badge/Platforms-amd64%20%7C%20arm64-555555)](#tested-environments)
 
-## MagicMartin fork enhancements (v0.1.1)
+English | [Русский](README_RU.md)
 
-This fork contains additional stability and safety improvements developed and
-tested on Ubuntu Linux.
+## Manzick’s enhancements
+
+This fork builds upon MagicMartin67’s icloud-synk, adding synchronization safety
+improvements, multi-folder support, and Docker deployment capabilities.
+
+### Tested environments
+
+The project is tested on a Raspberry Pi 5 (ARM64) running Raspberry Pi OS Lite,
+on Arch Linux, and in Docker deployments.
 
 
 ### Added features
@@ -16,7 +26,7 @@ tested on Ubuntu Linux.
   - Controlled by `protect_deletions`.
 
 - **Three-way conflict handling**
-  - Synchronisation compares:
+  - Synchronization compares:
     - local files
     - iCloud files
     - previous sync state
@@ -24,7 +34,7 @@ tested on Ubuntu Linux.
   - Conflicting versions receive a timestamp suffix.
 
 - **Selected iCloud Drive folder mappings**
-  - Synchronisation can be limited to one legacy `drive_subfolder`, or to several
+  - Synchronization can be limited to one legacy `drive_subfolder`, or to several
     pre-existing iCloud Drive folders mapped to separate local directories with
     `drive_subfolders`.
   - Each mapping has its own conflict and deletion reconciliation while sharing one
@@ -97,41 +107,20 @@ What follows from that:
 
 ## Install
 
-### Prebuilt binary (no Go needed)
-
-Static, CGO-free binaries are attached to every
-[release](https://github.com/kolesnikav/icloud-synk/releases) for `linux/amd64` and
-`linux/arm64`:
+The project is currently installed from source. It requires Go 1.25+ for confined
+filesystem operations; its dependencies are `fsnotify` and `x/sys`.
 
 ```bash
-curl -fsSL https://github.com/kolesnikav/icloud-synk/releases/latest/download/icloud-synk-linux-amd64.tar.gz \
-  | tar -xz --strip-components=1 -C /tmp icloud-synk-linux-amd64/icloud-synk
-install -Dm755 /tmp/icloud-synk ~/.local/bin/icloud-synk
-icloud-synk version
-```
-
-Each tarball also carries `icloud-synk.service` and both READMEs. `SHA256SUMS` next to the
-archives lets you verify the download:
-
-```bash
-sha256sum -c SHA256SUMS --ignore-missing
-```
-
-### From source
-
-```bash
-git clone git@github.com:kolesnikav/icloud-synk.git && cd icloud-synk
+git clone git@github.com:manzick/icloud-synk.git && cd icloud-synk
 make build              # bin/icloud-synk
 make install            # ~/.local/bin/icloud-synk
 ```
 
-Or straight through Go:
+Alternatively, after cloning the repository, install directly with Go:
 
 ```bash
-go install github.com/kolesnikav/icloud-synk/cmd/icloud-synk@latest
+go install ./cmd/icloud-synk
 ```
-
-Requires Go 1.25+ for confined filesystem operations. Dependencies: `fsnotify` and `x/sys`.
 
 ## First run
 
@@ -239,6 +228,9 @@ see [verification details and reserved-name ambiguity](BACKUP_RETENTION.md#drive
   "password_command": ""
 }
 ```
+
+Additional fork-specific parameters, including `protect_deletions` and
+`drive_subfolders`, are documented in [Multiple independent Drive folders](#multiple-independent-drive-folders).
 
 * `delete_remote` — a local deletion moves the file to the iCloud trash.
 * `delete_local` — a deletion in iCloud moves the local file to `.icloud-synk/trash/<date>/`.
